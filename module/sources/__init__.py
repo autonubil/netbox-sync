@@ -9,6 +9,7 @@
 
 # define all available sources here
 from .vmware.connection import VMWareHandler
+from .sophos_utm.sync import SophosUTMHandler
 from .check_redfish.import_inventory import CheckRedfish
 
 from module.common.configuration import get_config
@@ -16,7 +17,7 @@ from module.common.logging import get_logger
 from module.netbox.inventory import NetBoxInventory
 
 # list of valid sources
-valid_sources = [VMWareHandler, CheckRedfish]
+valid_sources = [VMWareHandler, CheckRedfish, SophosUTMHandler]
 
 
 def validate_source(source_class_object=None, state="pre"):
