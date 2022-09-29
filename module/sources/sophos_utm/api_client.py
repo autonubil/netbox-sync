@@ -50,8 +50,21 @@ class SophosUTMClient():
     def get_network_interfaces(self):
         return self.get('objects/network/interface_network')
 
-    def get_ethernet_interface(self, networkId):
-        return self.get('objects/interface/ethernet/{}'.format(networkId))
+    def get_itfhw_lag(self):
+        return self.get('objects/itfhw/lag')
+    
+    def get_itfparams_link_aggregation_group(self):
+        return self.get('objects/itfparams/link_aggregation_group')
+
+
+    def get_itfhw_ethernet(self):
+        return self.get('objects/itfhw/ethernet')
+        
+    def get_itfhw_ethernet_used_by(self, ref):
+        return self.get('objects/itfhw/ethernet/{}/usedby'.format(ref))
+
+    def get_ethernet_interface(self, ref):
+        return self.get('objects/interface/ethernet/{}'.format(ref))
     
     def get_primary_interface(self, primary_interface):
         return self.get('objects/itfparams/primary/{}'.format(primary_interface))

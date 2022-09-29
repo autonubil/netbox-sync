@@ -105,6 +105,8 @@ class SophosUTMHandler(SourceBase):
     vrf = None
     vrf_object = None
     device_object = None
+    raw_interfaces = {}
+    lags = {}
 
     def __init__(self, name=None, settings=None, inventory=None):
 
@@ -137,7 +139,10 @@ class SophosUTMHandler(SourceBase):
         Then parse the system data first and then all components.
         """
 
-        self.import_prefixes()
+        self.get_vrf()
+        self.get_device()
+        
+        self.update_interfaces()
 
     def get_device(self):
         if isinstance(self.device_object, NBDevice):
@@ -226,7 +231,72 @@ class SophosUTMHandler(SourceBase):
         self.device_object = self.inventory.add_update_object(
             NBDevice, data=device_data, read_from_netbox=False, source=self)
 
+
         return self.device_object
+
+
+    def update_interfaces(self):
+        # ensure interfaces
+        existing_interfaces = self.inventory.get_all_interfaces(self.device_object)
+        
+        # first ensure LAGs
+        lag_ifs = {}
+        for lag in self.client.get_itfhw_lag():
+            lag_ifs[lag["_ref"]]=lag
+        for interface in self.client.get_itfparams_link_aggregation_group():
+            if len(interface["itfhw"]) > 0:
+                lag = lag_ifs[interface["name"]]
+                interface_data = {
+                    "name":lag["name"],
+                    "device": self.device_object,
+                    "label":lag["hardware"],
+                    "description": interface["description"],
+                    "mac_address":interface["mac"],
+                    "type": "Link Aggregation Group (LAG)"
+                }
+                
+                self.lags[interface["_ref"]] =interface
+
+
+        for interface in self.client.get_itfhw_ethernet():
+            name = interface["name"]
+            hw =interface["hardware"]
+            id = None
+            for existing_interface in existing_interfaces:
+                test_name = grab(existing_interface, "data.name")
+                pat = '\\b{}\\b'.format(hw)
+                if re.match(pat, test_name):
+                    id = existing_interface.nb_id
+
+            if_type = 'other'    
+            types = interface["supported_link_modes"].split(',')
+            for test_type in types:
+                if test_type.startswith(interface["speed"]):
+                    if_type=test_type
+                    break
+
+            interface_data = {
+                "name":name,
+                "device": self.device_object,
+                "label":hw,
+                "description": interface["description"],
+                "mac_address":interface["mac"],
+                "duplex":interface["duplex"],
+                "speed":interface["speed"],
+                "type": if_type,
+            }
+            if id:
+                interface_data["id"] = id
+            # lag?
+            used_by = self.client.get_itfhw_ethernet_used_by(interface["_ref"])
+            for ref in used_by:
+                if ref in self.lags:
+                    interface_data["parent"] = self.lags[ref]
+
+            
+            self.raw_interfaces[interface["_ref"]] = interface
+            self.inventory.add_update_object(NBInterface, data=interface_data),
+
 
     def get_vrf(self):
         if isinstance(self.vrf_object, NBVRF):
@@ -252,9 +322,7 @@ class SophosUTMHandler(SourceBase):
 
     def import_prefixes(self):
         interfaces = self.client.get_network_interfaces()
-        vrf = self.get_vrf()
-        device = self.get_device()
-
+        
         log.info('if: {}'.format(interfaces))
 
     def parse_config_settings(self, config_settings):
