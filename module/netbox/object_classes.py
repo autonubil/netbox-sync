@@ -32,7 +32,18 @@ class NetBoxInterfaceType:
 
     # valid types which can be used within netbox-sync
     valid_types = {
+        "lag": "Link Aggregation Group (LAG)",
         "virtual":         "Virtual",
+        "ieee802.11a": "IEEE 802.11a",
+        "ieee802.11g": "IEEE 802.11b/g",
+        "ieee802.11n": "IEEE 802.11n",
+        "ieee802.11ac": "IEEE 802.11ac",
+        "ieee802.11ad": "IEEE 802.11ad",
+        "ieee802.11ax": "IEEE 802.11ax",
+        "ieee802.11ay": "IEEE 802.11ay",
+        "ieee802.15.1": "IEEE 802.15.1 (Bluetooth)",
+        "other-wireless": "Other (Wireless)",
+
         "other":             "Other",
         "100base-tx":            100,
         "1000base-t":          1_000,
@@ -1361,8 +1372,8 @@ class NBPrefix(NetBoxObject):
 
         super().update(data=data, read_from_netbox=read_from_netbox, source=source)
 
-        if read_from_netbox is False:
-            raise ValueError(f"Adding {self.name} by this program is currently not implemented.")
+        # if read_from_netbox is False:
+        #    raise ValueError(f"Adding {self.name} by this program is currently not implemented.")
 
 
 class NBManufacturer(NetBoxObject):
@@ -1592,7 +1603,11 @@ class NBInterface(NetBoxObject):
             "tagged_vlans": NBVLANList,
             "description": 200,
             "connection_status": bool,
-            "tags": NBTagList
+            "tags": NBTagList,
+            "duplex": ["full", "half", "auto"],
+            "speed": int,
+            "parent": NetBoxObject,
+            "lag": NetBoxObject,
         }
         super().__init__(*args, **kwargs)
 

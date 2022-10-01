@@ -8,11 +8,12 @@ import re
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 import re
 
-from ipaddress import ip_address, ip_network, ip_interface
+from ipaddress import ip_address, ip_network, ip_interface,IPv4Network
 from urllib.parse import unquote
 
 # noinspection PyUnresolvedReferences
 from packaging import version
+from pytablewriter import IpAddress
 
 from .api_client import SophosUTMClient
 
@@ -106,7 +107,8 @@ class SophosUTMHandler(SourceBase):
     vrf_object = None
     device_object = None
     raw_interfaces = {}
-    lags = {}
+    interfaces = {}
+    interfaces_names = {}
 
     def __init__(self, name=None, settings=None, inventory=None):
 
@@ -158,6 +160,7 @@ class SophosUTMHandler(SourceBase):
         cluster_nodes = 1
         cluster_node_id = nodes['ha.node_id']
         cluster_status = nodes['ha.status']
+        cluster_mode = nodes['ha.mode']
         license = nodes['licensing.license']
         site_name = nodes['snmp.device_location']
 
@@ -218,9 +221,16 @@ class SophosUTMHandler(SourceBase):
         device_data = {
             "name": device_name,
             "asset_tag": system_id,
-            "status": "active",
-            "primary_ip4": self.inventory.add_update_object(NBIPAddress, data={"address": self.client.get_primary_address(), "vrf": self.vrf_object, }),
         }
+        if cluster:
+            if cluster_mode == "master":
+                device_data["status"] = "active"
+            else:
+                device_data["status"] = "offline"
+        else:
+            device_data["status"] = "active"
+
+
         if site_object:
             device_data["site"] = site_object
         if role_object:
@@ -231,33 +241,164 @@ class SophosUTMHandler(SourceBase):
         self.device_object = self.inventory.add_update_object(
             NBDevice, data=device_data, read_from_netbox=False, source=self)
 
+        # device_data["primary_ip4"] =  self.inventory.add_update_object(NBIPAddress, data={"address": self.client.get_primary_address(), "vrf": self.vrf_object })
+        #self.device_object = self.inventory.add_update_object(
+        #    NBDevice, data=device_data, read_from_netbox=False, source=self)
 
         return self.device_object
 
+    def update_hw_interfaces(self, all_interfaces):
+        for interface in all_interfaces:
+            if interface["_type"] == 'itfhw/ethernet':
+                name = interface["name"]
+                hw =interface["hardware"]
+                nic_type = NetBoxInterfaceType('other')
+                types = interface["supported_link_modes"].split(',')
+                for test_type in types:
+                    if test_type.startswith(interface["speed"]):
+                        nic_type = NetBoxInterfaceType(test_type.split("/")[0])
+                        if nic_type.get_common_type() == "other":
+                            nic_type = NetBoxInterfaceType(int(interface["speed"]))
+                        break
+
+                interface_data = {
+                    "name":name,
+                    "device": self.device_object,
+                    "label":hw,
+                    "description": interface["description"],
+                    "mac_address": interface["mac"].upper(),
+                    "duplex": interface["duplex"].lower(),
+                    "speed": int(interface["speed"])*1000,
+                    "type": nic_type.get_common_type(),
+                }
+                 
+                self.inventory.add_update_object(NBInterface, data=interface_data)
+
+    def add_addresse(self,nbinterface, address):
+        ip4 = "{}/{}".format(address["address"],address["netmask"])
+        ip4net = IPv4Network(ip4, strict = False)
+        prefix_data = {
+            "prefix": ip4net,
+            "site": grab(self.device_object, "data.site"),
+            "description": grab(nbinterface,"data.name"),
+            "vrf": self.vrf_object,
+        }
+        self.inventory.add_update_object(NBPrefix, data=prefix_data, source=self)
+
+        address_data = {
+            "address": ip4,
+            "assigned_object_type": "dcim.interface",
+            "assigned_object_id": nbinterface,
+            "description":  address["name"]
+        }
+        if "hostname" in address and address["hostname"] != "":
+            address_data["dns_name"] = address["hostname"]
+        return self.inventory.add_update_object(NBIPAddress, data=address_data, source=self)
+        
+
+    def add_addresses(self,nbinterface, interface):
+        if "primary_address_object" in interface:
+            primary_address_object = interface["primary_address_object"]
+            nbpimary_address = self.add_addresse(nbinterface, primary_address_object)
+            # nbinterface.primary_ip4 = nbpimary_address
+
+        if "additional_address_objects" in interface:
+            additional_address_objects = interface["additional_address_objects"]
+            for additional_address_object in additional_address_objects:
+                self.add_addresse(nbinterface, additional_address_object)
+
+
+    def update_ethernet_interfaces(self, all_interfaces):
+        for interface in all_interfaces:
+            ifhw = None
+            if "itfhw_object" in interface:
+                ifhw = interface["itfhw_object"]
+                # dig into active lag W`HW`
+                if "hardware_object" in ifhw:
+                    ifhw = ifhw["hardware_object"]
+                hw =ifhw["hardware"]
+            if ifhw and ifhw["_type"] == 'itfhw/awe_network':
+                interface_data = {
+                    "name":interface_data["name"],
+                    "enabled": interface["status"],
+                    "device": self.device_object,
+                    "label":hw,
+                    "description": interface["comment"],
+                    "mac_address": ifhw["mac"].upper(),
+                    "mtu": interface["mtu"],
+                    "type": "other-wireless",
+                }
+                if ifhw["vlantag"] != "":
+                    interface_data["mode"] = "access"
+                    interface_data["untagged_vlan"] = self.inventory.add_update_object(NBVLAN, data={"vid": int(ifhw["vlantag"]), "name": ifhw["ssid"], "site": grab(self.device_object ,"data.site")  }, source=self)
+                    
+                nbinterface = self.inventory.add_update_object(NBInterface, data=interface_data, source=self)
+                self.add_addresses(nbinterface, interface)
+                continue
+            if interface["_type"] == 'interface/ethernet':
+                name = interface["name"]
+                if  "supported_link_modes" in ifhw:
+                    types = ifhw["supported_link_modes"].split(',')
+                    for test_type in types:
+                        if test_type.startswith(ifhw["speed"]):
+                            nic_type = NetBoxInterfaceType(test_type.split("/")[0])
+                            if nic_type.get_common_type() == "other":
+                                nic_type = NetBoxInterfaceType(int(ifhw["speed"]))
+                            break
+                else:
+                    nic_type = NetBoxInterfaceType('other')
+
+                interface_data = {
+                    "name":name,
+                    "device": self.device_object,
+                    "label":hw,
+                    "description": interface["comment"],
+                    "mac_address": ifhw["mac"].upper(),
+                    "type": nic_type.get_common_type(),
+                    "enabled": interface["status"],
+                    "connection_status": interface["link"],
+                    "mtu": interface["mtu"],
+                }
+
+                if interface["link"]:
+                    interface_data["mark_connected"] = True
+                    
+                if interface["_ref"] == "REF_IntEthManagement":
+                    interface_data["mgmt_only"] = True
+                nbinterface = self.inventory.add_update_object(NBInterface, data=interface_data, source=self)
+                self.add_addresses(nbinterface, interface)
 
     def update_interfaces(self):
         # ensure interfaces
-        existing_interfaces = self.inventory.get_all_interfaces(self.device_object)
-        
+        all_interfaces = self.client.get_interfaces()
+        self.update_hw_interfaces(all_interfaces)
+        self.update_ethernet_interfaces(all_interfaces)
+        return
+
+            # 'interface/ethernet'
+
         # first ensure LAGs
+        lag_hw = {}
         lag_ifs = {}
-        for lag in self.client.get_itfhw_lag():
-            lag_ifs[lag["_ref"]]=lag
-        for interface in self.client.get_itfparams_link_aggregation_group():
-            if len(interface["itfhw"]) > 0:
-                lag = lag_ifs[interface["name"]]
-                interface_data = {
-                    "name":lag["name"],
-                    "device": self.device_object,
-                    "label":lag["hardware"],
-                    "description": interface["description"],
-                    "mac_address":interface["mac"],
-                    "type": "Link Aggregation Group (LAG)"
-                }
-                
-                self.lags[interface["_ref"]] =interface
+        for interface in self.client.get_lags():
+            interface_data = {
+                "name":interface["lag_name"],
+                "device": self.device_object,   
+                "label":interface["hardware"],
+                "description": interface["lag_description"],
+                "mac_address": interface["virtual_mac"].upper(),
+                "duplex": interface["duplex"].lower(),
+                "speed": int(interface["speed"])*1000,
+                "type": 'lag',
+                "connection_status": interface["status"]
+            }
+            lag_hw[interface["_ref"]] =interface["itfhw"]
+            lag_ifs[interface["_ref"]] = self.inventory.add_update_object(NBInterface, data=interface_data)
+            self.interfaces[interface["_ref"]] = lag_ifs[interface["_ref"]]
+            self.raw_interfaces[interface["_ref"]] = interface
+            self.interfaces_names[interface["_ref"]] = interface["name"]
 
-
+        # hardware
         for interface in self.client.get_itfhw_ethernet():
             name = interface["name"]
             hw =interface["hardware"]
@@ -268,11 +409,13 @@ class SophosUTMHandler(SourceBase):
                 if re.match(pat, test_name):
                     id = existing_interface.nb_id
 
-            if_type = 'other'    
+            nic_type = NetBoxInterfaceType('other')
             types = interface["supported_link_modes"].split(',')
             for test_type in types:
                 if test_type.startswith(interface["speed"]):
-                    if_type=test_type
+                    nic_type = NetBoxInterfaceType(test_type.split("/")[0])
+                    if nic_type.get_common_type() == "other":
+                        nic_type = NetBoxInterfaceType(int(interface["speed"]))
                     break
 
             interface_data = {
@@ -280,23 +423,29 @@ class SophosUTMHandler(SourceBase):
                 "device": self.device_object,
                 "label":hw,
                 "description": interface["description"],
-                "mac_address":interface["mac"],
-                "duplex":interface["duplex"],
-                "speed":interface["speed"],
-                "type": if_type,
+                "mac_address": interface["mac"].upper(),
+                "duplex": interface["duplex"].lower(),
+                "speed": int(interface["speed"])*1000,
+                "type": nic_type.get_common_type(),
             }
+            
             if id:
                 interface_data["id"] = id
+
             # lag?
-            used_by = self.client.get_itfhw_ethernet_used_by(interface["_ref"])
-            for ref in used_by:
-                if ref in self.lags:
-                    interface_data["parent"] = self.lags[ref]
+            for ifid, hwlist in lag_hw.items():
+                for hw in hwlist:
+                    if hw == interface["_ref"]:
+                        if lag_ifs[ifid].nb_id  > 0:
+                            interface_data["lag"] = lag_ifs[ifid]
+                        break
 
-            
+            nbinterface = self.inventory.add_update_object(NBInterface, data=interface_data),
+            self.interfaces[interface["_ref"]] = nbinterface
             self.raw_interfaces[interface["_ref"]] = interface
-            self.inventory.add_update_object(NBInterface, data=interface_data),
+            self.interfaces_names[interface["_ref"]] = interface["name"]
 
+ 
 
     def get_vrf(self):
         if isinstance(self.vrf_object, NBVRF):
@@ -304,11 +453,8 @@ class SophosUTMHandler(SourceBase):
 
         if self.vrf is None:
             return None
-
-        this_vrf = None
-
         for vrf in self.inventory.get_all_items(NBVRF):
-            if grab(self, "data.name") == self.vrf:
+            if grab(vrf, "data.name") == self.vrf:
                 log.debug(f"vrf '{self.vrf}' was resolved")
                 self.vrf_object = vrf
                 return self.vrf_object
@@ -319,11 +465,6 @@ class SophosUTMHandler(SourceBase):
         self.vrf_object = self.inventory.add_object(
             NBVRF, data=vrf_data, read_from_netbox=False, source=self)
         return self.vrf_object
-
-    def import_prefixes(self):
-        interfaces = self.client.get_network_interfaces()
-        
-        log.info('if: {}'.format(interfaces))
 
     def parse_config_settings(self, config_settings):
         """

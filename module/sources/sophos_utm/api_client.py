@@ -1,10 +1,21 @@
 import requests
+import re
 from requests.auth import HTTPBasicAuth
 from module.common.logging import get_logger
 
 
 log = get_logger()
 api_url = "/api/"
+
+re_lag_id = re.compile('^REF_ItfLagLag(\d+)$', re.MULTILINE)
+lag_translation= {
+    "0": "REF_LagOne",
+    "1": "REF_LagTwo",
+    "2": "REF_LagThree",
+    "3": "REF_LagFour",
+    "4": "REF_LagFive",
+    "6": "REF_LagSix",
+}
 
 class SophosUTMClient():
 
@@ -27,6 +38,7 @@ class SophosUTMClient():
         "proxy_port": None,
     }
 
+    lags = None
 
     def __init__(self, settings=None):
         self.parse_config_settings(settings)
@@ -36,7 +48,6 @@ class SophosUTMClient():
     def get(self, uri, query=None ):
         api_url =   'https://{0}:{1}/api/{2}'.format(  self.host_fqdn, self.port, uri)
         headers = [{'user-agent', 'netbox-sync/1.0', 'content-Type'} ,{'application/json', 'accept' ,'application/json' }]
-
         response = requests.get(api_url, params=query, verify=self.validate_tls_certs,  auth=HTTPBasicAuth(self.username, self.password))
         return response.json()
 
@@ -50,22 +61,159 @@ class SophosUTMClient():
     def get_network_interfaces(self):
         return self.get('objects/network/interface_network')
 
-    def get_itfhw_lag(self):
-        return self.get('objects/itfhw/lag')
+    def get_itfhw_lag(self, ref=None):
+        if ref:
+            return self.get('objects/itfhw/lag/{}'.format(ref))
+        else:
+            return self.get('objects/itfhw/lag')
     
-    def get_itfparams_link_aggregation_group(self):
-        return self.get('objects/itfparams/link_aggregation_group')
+    def get_itfparams_link_aggregation_group(self, refid=None):
+        if refid:
+            return self.get('objects/itfparams/link_aggregation_group/{}'.format(refid))
+        else:
+            return self.get('objects/itfparams/link_aggregation_group')
+
+    def get_lags(self):
+        if self.lags:
+            return self.lags
+        lag_ifs = self.get_itfhw_lag()
+        result = {}
+        for lag_if in lag_ifs:
+            m = re_lag_id.match(lag_if["_ref"])
+            if m:
+                ifparam_ref = m.group(1)
+                lag_name = lag_translation[ifparam_ref]
+                params = self.get_itfparams_link_aggregation_group(lag_name)
+                params["hardware"] = lag_if["hardware"]
+                params["lag_description"] = lag_if["description"]
+                params["lag_name"] = lag_if["name"]
+                params["itfhw_details"] = {}
+                for if_ref in params["itfhw"]:
+                    lag_member = self.get_itfhw_ethernet(if_ref)
+                    params["itfhw_details"][if_ref] = lag_member
+                    if lag_member["name"] == params["name"]:
+                        params["itfhw_active"] = lag_member
+                        params["speed"] = lag_member["speed"]
+                        params["duplex"] = lag_member["duplex"]
+                        params["supported_link_modes"] = lag_member["supported_link_modes"]
+                result[params["hardware"]] = params
+        self.lags = result
+        return result
+    
+    
+    def get_itfparams_primary(self, ref =None):
+        if ref:
+            return self.get('objects/itfparams/primary/{}'.format(ref))
+        else:
+            return self.get('objects/itfparams/primary')
+    
+    def get_itfparams_secondary(self, ref =None):
+        if ref:
+            return self.get('objects/itfparams/secondary/{}'.format(ref))
+        else:
+            return self.get('objects/itfparams/secondary')
 
 
-    def get_itfhw_ethernet(self):
-        return self.get('objects/itfhw/ethernet')
+    def get_network_interface_address(self, ref =None):
+        if ref:
+            return self.get('objects/network/interface_address/{}'.format(ref))
+        else:
+            return self.get('objects/network/interface_address')
+
+    def get_network_interface_network(self, ref =None):
+        if ref:
+            return self.get('objects/network/interface_network/{}'.format(ref))
+        else:
+            return self.get('objects/network/interface_network')
+
+
+    def expand_itfparams_primary(self, primary):
+        primary["interface_address_object"] = self.get_network_interface_address(primary["interface_address"])
+        primary["interface_network_object"] = self.get_network_interface_network(primary["interface_network"])
+        return primary
+
+    def get_itfparams_primary_ex(self, ref =None):
+        if ref:
+            primary = self.get_itfparams_primary(ref)
+            return self.expand_itfparams_primary(primary)
+        else:
+            primaries = self.get_itfparams_primary()
+            result = []
+            for primary in primaries:
+                result.append(self.expand_itfparams_primary(primary))
+            return result
+
+
+    def get_itfhw_ethernet(self, ref=None):
+        if ref:
+            return self.get('objects/itfhw/ethernet/{}'.format(ref))
+        else:
+            return self.get('objects/itfhw/ethernet')
+ 
+    def get_itfhw_awe_network(self, ref=None):
+        if ref:
+            return self.get('objects/itfhw/awe_network/{}'.format(ref))
+        else:
+            return self.get('objects/itfhw/awe_network')
         
     def get_itfhw_ethernet_used_by(self, ref):
         return self.get('objects/itfhw/ethernet/{}/usedby'.format(ref))
 
-    def get_ethernet_interface(self, ref):
-        return self.get('objects/interface/ethernet/{}'.format(ref))
+    def get_interface_ethernet(self, ref=None):
+        if ref:
+            return self.get('objects/interface/ethernet/{}'.format(ref))
+        else:
+            return self.get('objects/interface/ethernet')
     
+    def get_interface_vlan(self, ref=None):
+        if ref:
+            return self.get('objects/interface/vlan/{}'.format(ref))
+        else:
+            return self.get('objects/interface/vlan')
+
+
+    def enrich_interface(self,interface):
+        hw = interface["itfhw"]
+        if hw.startswith("REF_ItfLag"):
+            interface["itfhw_object"] = self.get_itfhw_lag(hw)
+            lags = self.get_lags()
+            interface["itfhw_object"]["hardware_object"] = lags[interface["itfhw_object"]["hardware"]]
+        elif hw.startswith("REF_ItfAwe"):
+            interface["itfhw_object"] = self.get_itfhw_awe_network(hw)
+        else:
+            interface["itfhw_object"] = self.get_itfhw_ethernet(hw)
+        primary_address_ref = interface["primary_address"] 
+        if primary_address_ref != "":
+            interface["primary_address_object"] = self.get_itfparams_primary(primary_address_ref) #ex?
+
+        interface["additional_address_objects"] = []
+        for additonal_address in interface["additional_addresses"]:
+            interface["additional_address_objects"].append(self.get_itfparams_secondary(additonal_address))
+        return interface
+
+    def get_interfaces(self):
+        all_interfaces = []
+        used_hardware = {}
+        # physical
+        for interface in self.get_interface_ethernet():
+            interface = self.enrich_interface(interface)
+            all_interfaces.append(interface)
+            ifhw = interface["itfhw_object"]
+            if "hardware_object" in ifhw:
+                ifhw = ifhw["hardware_object"]
+            used_hardware[ifhw["_ref"]] = True
+        
+        # configured physical
+        for interface in self.get_itfhw_ethernet():
+            if not interface["_ref"] in used_hardware:
+                all_interfaces.append(interface) 
+
+        # virtual
+        for interface in self.get_interface_vlan():
+            all_interfaces.append(self.enrich_interface(interface))
+
+        return all_interfaces
+
     def get_primary_interface(self, primary_interface):
         return self.get('objects/itfparams/primary/{}'.format(primary_interface))
 
