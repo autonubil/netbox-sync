@@ -661,7 +661,8 @@ class NetBoxHandler:
                             unresolved_dependency_data[key] = value
                         else:
                             data_to_patch[key] = value.get_nb_reference()
-
+                    elif isinstance(value, (IPv4Network, IPv6Network)):
+                        data_to_patch[key] = "{}/{}".format(value.network_address, value.netmask)
                     else:
                         data_to_patch[key] = value
 

@@ -2,7 +2,7 @@ import requests
 import re
 from requests.auth import HTTPBasicAuth
 from module.common.logging import get_logger
-
+import urllib3
 
 log = get_logger()
 api_url = "/api/"
@@ -38,10 +38,18 @@ class SophosUTMClient():
         "proxy_port": None,
     }
 
-    lags = None
+    lags= None
+    all_interfaces= None
+    itfparams_secondary= None
+    itfparams_secondary_ref= None
+    itfparams_primary= None
+    itfparams_primary_ref= None
 
     def __init__(self, settings=None):
         self.parse_config_settings(settings)
+        if not self.validate_tls_certs:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         version_info = self.get_version()
         log.info ('sophos version: {0}/{1}'.format( version_info['utm'], version_info['restd']) )
 
@@ -101,24 +109,47 @@ class SophosUTMClient():
         return result
     
     
+
     def get_itfparams_primary(self, ref =None):
+        if not self.itfparams_primary:
+                self.itfparams_primary = self.get('objects/itfparams/primary')
+                self.itfparams_primary_ref = {}
+                for primary in self.itfparams_primary:
+                    self.itfparams_primary_ref[primary["_ref"]] = primary
         if ref:
-            return self.get('objects/itfparams/primary/{}'.format(ref))
+            return self.itfparams_primary_ref[ref]
         else:
-            return self.get('objects/itfparams/primary')
+            return self.itfparams_primary
+
+#        if ref:
+#            return self.get('objects/itfparams/primary/{}'.format(ref))
+#        else:
+#            return self.get('objects/itfparams/primary')
     
+
     def get_itfparams_secondary(self, ref =None):
+        if not self.itfparams_secondary:
+                self.itfparams_secondary = self.get('objects/itfparams/secondary')
+                self.itfparams_secondary_ref = {}
+                for secondary in self.itfparams_secondary:
+                    self.itfparams_secondary_ref[secondary["_ref"]] = secondary
         if ref:
-            return self.get('objects/itfparams/secondary/{}'.format(ref))
+            return self.itfparams_secondary_ref[ref]
         else:
-            return self.get('objects/itfparams/secondary')
+            return self.itfparams_secondary
+
+#    def get_itfparams_secondary(self, ref =None):
+#        if ref:
+#            return self.get('objects/itfparams/secondary/{}'.format(ref))
+#        else:
+#            return self.get('objects/itfparams/secondary')
 
 
-    def get_network_interface_address(self, ref =None):
-        if ref:
-            return self.get('objects/network/interface_address/{}'.format(ref))
-        else:
-            return self.get('objects/network/interface_address')
+    # def get_network_interface_address(self, ref =None):
+    #     if ref:
+    #         return self.get('objects/network/interface_address/{}'.format(ref))
+    #     else:
+    #         return self.get('objects/network/interface_address')
 
     def get_network_interface_network(self, ref =None):
         if ref:
@@ -155,6 +186,12 @@ class SophosUTMClient():
             return self.get('objects/itfhw/awe_network/{}'.format(ref))
         else:
             return self.get('objects/itfhw/awe_network')
+
+    def get_itfhw_red_server(self, ref=None):
+        if ref:
+            return self.get('objects/itfhw/red_server/{}'.format(ref))
+        else:
+            return self.get('objects/itfhw/red_server')
         
     def get_itfhw_ethernet_used_by(self, ref):
         return self.get('objects/itfhw/ethernet/{}/usedby'.format(ref))
@@ -180,6 +217,8 @@ class SophosUTMClient():
             interface["itfhw_object"]["hardware_object"] = lags[interface["itfhw_object"]["hardware"]]
         elif hw.startswith("REF_ItfAwe"):
             interface["itfhw_object"] = self.get_itfhw_awe_network(hw)
+        elif hw.startswith("REF_ItfRedReds"):
+            interface["itfhw_object"] = self.get_itfhw_red_server(hw)
         else:
             interface["itfhw_object"] = self.get_itfhw_ethernet(hw)
         primary_address_ref = interface["primary_address"] 
@@ -192,27 +231,28 @@ class SophosUTMClient():
         return interface
 
     def get_interfaces(self):
-        all_interfaces = []
-        used_hardware = {}
-        # physical
-        for interface in self.get_interface_ethernet():
-            interface = self.enrich_interface(interface)
-            all_interfaces.append(interface)
-            ifhw = interface["itfhw_object"]
-            if "hardware_object" in ifhw:
-                ifhw = ifhw["hardware_object"]
-            used_hardware[ifhw["_ref"]] = True
-        
-        # configured physical
-        for interface in self.get_itfhw_ethernet():
-            if not interface["_ref"] in used_hardware:
-                all_interfaces.append(interface) 
+        if not self.all_interfaces:
+            self.all_interfaces = []
+            used_hardware = {}
+            # physical
+            for interface in self.get_interface_ethernet():
+                interface = self.enrich_interface(interface)
+                self.all_interfaces.append(interface)
+                ifhw = interface["itfhw_object"]
+                if "hardware_object" in ifhw:
+                    ifhw = ifhw["hardware_object"]
+                used_hardware[ifhw["_ref"]] = True
+            
+            # configured physical
+            for interface in self.get_itfhw_ethernet():
+                if not interface["_ref"] in used_hardware:
+                    self.all_interfaces.append(interface) 
 
-        # virtual
-        for interface in self.get_interface_vlan():
-            all_interfaces.append(self.enrich_interface(interface))
+            # virtual
+            for interface in self.get_interface_vlan():
+                self.all_interfaces.append(self.enrich_interface(interface))
 
-        return all_interfaces
+        return self.all_interfaces
 
     def get_primary_interface(self, primary_interface):
         return self.get('objects/itfparams/primary/{}'.format(primary_interface))

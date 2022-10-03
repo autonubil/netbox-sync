@@ -522,7 +522,7 @@ class NetBoxObject:
                         continue
 
                 # check if value is in defined list
-                elif value not in defined_value_type:
+                elif value not in defined_value_type and value.__class__ not in defined_value_type:
                     log.error(f"Invalid data type for '{key}' (must be one of {defined_value_type}), got: '{value}'")
                     continue
 
@@ -698,6 +698,10 @@ class NetBoxObject:
                 read_from_netbox = True if secondary_key_value.get("id", 0) != 0 else False
                 secondary_key_value = self.get_display_name(data=secondary_key_value)
 
+            if secondary_key_value is None and isinstance(self, NBPrefix):
+                secondary_key_value = "Global"
+                my_name = f"{my_name} ({secondary_key_value})"    
+                
             if secondary_key_value is None and read_from_netbox is False and include_secondary_key_if_present is False:
                 log.warning(f"Unable to determine second key '{secondary_key}' for {self.name} '{my_name}', "
                             f"got: {org_secondary_key_value}")
@@ -776,7 +780,7 @@ class NetBoxObject:
         list: of NetBoxObject sub classes
         """
 
-        r = [x for x in self.data_model.values() if x in NetBoxObject.__subclasses__()]
+        r = [x for x in self.data_model.values() if x != self.__class__  and x in NetBoxObject.__subclasses__()]
         r.extend([x.member_type for x in self.data_model.values() if x in NBObjectList.__subclasses__()])
 
         return r
@@ -1227,6 +1231,7 @@ class NBTenant(NetBoxObject):
             "slug": 100,
             "comments": str,
             "description": 200,
+            "group": NBTenantGroup,
             "tags": NBTagList
         }
         super().__init__(*args, **kwargs)
@@ -1243,8 +1248,43 @@ class NBSite(NetBoxObject):
             "name": 100,
             "slug": 100,
             "comments": str,
+            "group": NBSiteGroup,
             "tenant": NBTenant,
+            "tenant_group": NBTenantGroup,
             "tags": NBTagList
+        }
+        super().__init__(*args, **kwargs)
+
+class NBSiteGroup(NetBoxObject):
+    name = "site-group"
+    api_path = "dcim/site-groups"
+    primary_key = "name"
+    prune = False
+
+    def __init__(self, *args, **kwargs):
+        self.data_model = {
+            "name": 100,
+            "slug": 100,
+            "comments": str,
+            "tags": NBTagList,
+            "parent": NBSiteGroup,
+            "tenant_group": NBTenantGroup,
+        }
+        super().__init__(*args, **kwargs)
+
+class NBTenantGroup(NetBoxObject):
+    name = "tenant-group"
+    api_path = "tenancy/tenant-groups"
+    primary_key = "name"
+    prune = False
+
+    def __init__(self, *args, **kwargs):
+        self.data_model = {
+            "name": 100,
+            "slug": 100,
+            "comments": str,
+            "tags": NBTagList,
+            "parent": NBTenantGroup,
         }
         super().__init__(*args, **kwargs)
 
@@ -1278,6 +1318,7 @@ class NBVLAN(NetBoxObject):
             "vid": int,
             "name": 64,
             "site": NBSite,
+            "sitegroup": NBSiteGroup,
             "description": 200,
             "tenant": NBTenant,
             "tags": NBTagList
@@ -1345,13 +1386,17 @@ class NBPrefix(NetBoxObject):
     name = "IP prefix"
     api_path = "ipam/prefixes"
     primary_key = "prefix"
-    prune = False
+    secondary_key = "vrf"
+    enforce_secondary_key = False
+    prune = True
 
     def __init__(self, *args, **kwargs):
         self.data_model = {
-            "prefix": [IPv4Network, IPv6Network],
+            "prefix": [IPv4Network, IPv6Network,str],
             "site": NBSite,
+            "sitegroup": NBSiteGroup,
             "tenant": NBTenant,
+            "tenangroup": NBTenantGroup,
             "vlan": NBVLAN,
             "vrf": NBVRF,
             "description": 200,
@@ -1603,11 +1648,12 @@ class NBInterface(NetBoxObject):
             "tagged_vlans": NBVLANList,
             "description": 200,
             "connection_status": bool,
+            "mark_connected": bool,
             "tags": NBTagList,
             "duplex": ["full", "half", "auto"],
             "speed": int,
-            "parent": NetBoxObject,
-            "lag": NetBoxObject,
+            "parent": NBInterface,
+            "lag": NBInterface,
         }
         super().__init__(*args, **kwargs)
 
