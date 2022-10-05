@@ -23,6 +23,7 @@ from module.common.logging import get_logger, DEBUG3
 from module.common.misc import grab, dump, get_string_or_none, plural, quoted_split
 from module.common.support import normalize_mac_address, ip_valid_to_add_to_netbox
 from module.netbox.object_classes import (
+    NBFHRPGroupItem,
     NetBoxInterfaceType,
     NBObjectList,
     NBTag,
@@ -106,6 +107,8 @@ class SophosUTMHandler(SourceBase):
         "site_spare": None,
         "tenant_group": None,
         "create_company_tenant_group": False,
+        "cluster_sync": False,
+        "fhrp_id": int,
     }
 
     deprecated_settings = {}
@@ -120,9 +123,8 @@ class SophosUTMHandler(SourceBase):
     enabled = False
     client = SophosUTMClient
     vrf = None
-    vrf_object = None
-    device_object = None
     raw_interfaces = {}
+    is_cluster = False
 
     site_group= None
     site_a=None
@@ -131,14 +133,19 @@ class SophosUTMHandler(SourceBase):
     site_spare=None
     tenant_group=None
     create_company_tenant_group=False
+    cluster_sync=False
+    #fhrp_id = -1
 
-    site_group_object= None
-    site_object= None
-    site_a_object=None
-    site_b_object=None
-    site_floating_object=None
-    site_spare_object=None
-    tenant_group_object=None
+    nb_vrf = None
+    nb_device = None
+    nb_site_group= None
+    nb_site= None
+    nb_site_a=None
+    nb_site_b=None
+    nb_site_floating=None
+    nb_site_spare=None
+    nb_tenant_group=None
+    #nb_fhrp = None
 
 
     def __init__(self, name=None, settings=None, inventory=None):
@@ -177,27 +184,101 @@ class SophosUTMHandler(SourceBase):
 
         self.get_vrf()
         self.get_device()
-        
-        self.update_interfaces()
+#        if self.fhrp_id > 0 and  self.is_cluster and self.cluster_sync:
+#            self.get_fhrp()
 
-    def get_device(self):
-        if isinstance(self.device_object, NBDevice):
-            return self.device_object
+        if self.nb_device:    
+            self.update_interfaces()
+            if self.is_cluster and self.cluster_sync:
+                self.nb_device = None
+                self.get_device(True)
+            if self.nb_device:
+                self.update_interfaces()
+
+    def ensure_nb_objects(self, site_name):
+        
+        site_data={
+        }
+
+        if self.tenant_group and not self.nb_tenant_group:
+            self.nb_tenant_group = self.inventory.get_by_data(
+                NBTenantGroup, data={"name": self.tenant_group})
+            if self.nb_tenant_group is None and self.tenant_group and self.tenant_group != "":
+                self.nb_tenant_group = self.inventory.add_update_object(
+                    NBTenantGroup, data={"name": self.tenant_group}, source=self)
+            if self.nb_tenant_group:
+                site_data["tenant_group"] = self.nb_tenant_group
+
+        if self.site_group and not self.nb_site_group:
+            self.nb_site_group = self.inventory.get_by_data(
+                NBSiteGroup, data={"name": self.site_group})
+            if self.nb_site_group is None and self.site_group and self.site_group != "":
+                self.nb_site_group = self.inventory.add_update_object(
+                    NBSiteGroup, data={"name": self.site_group}, source=self)
+            if self.nb_site_group:
+                site_data["group"] = self.nb_site_group
+
+        if site_name and not self.nb_site:
+            site_data["name"] = site_name
+            self.nb_site = self.inventory.get_by_data(
+                NBSite, data=site_data)
+            if self.nb_site is None and site_name and site_name != "":
+                self.nb_site = self.inventory.add_update_object(
+                    NBSite, data=site_data, source=self)
+
+        if self.site_a and not self.nb_site_a:
+            site_data["name"] = self.site_a
+            self.nb_site_a = self.inventory.get_by_data(
+                NBSite, data=site_data)
+            if self.nb_site_a is None:
+                self.nb_site_a = self.inventory.add_update_object(
+                    NBSite, data=site_data, source=self)
+
+        if self.site_b and not self.nb_site_b:
+            site_data["name"] = self.site_b
+            self.nb_site_b = self.inventory.get_by_data(
+                NBSite, data=site_data)
+            if self.nb_site_b is None:
+                self.nb_site_b = self.inventory.add_update_object(
+                    NBSite, data=site_data, source=self)
+
+        if self.site_floating and not self.nb_site_floating:
+            site_data["name"] = self.site_floating
+            self.nb_site_floating = self.inventory.get_by_data(
+                NBSite, data=site_data)
+            if self.nb_site_floating is None:
+                self.nb_site_floating = self.inventory.add_update_object(
+                    NBSite, data=site_data, source=self)
+
+        if self.site_spare and not self.nb_site_spare:
+            site_data["name"] = self.site_spare
+            self.nb_site_spare = self.inventory.get_by_data(
+                NBSite, data=site_data)
+            if self.nb_site_spare is None:
+                self.nb_site_spare = self.inventory.add_update_object(
+                    NBSite, data=site_data, source=self)
+
+    def get_device(self, invert_cluster=False):
+        if isinstance(self.nb_device, NBDevice):
+            return self.nb_device
 
         nodes = self.client.get_nodes()
-        system_id = nodes['settings.system_id']
+        if not invert_cluster:
+            system_id = nodes['settings.system_id']
+        else:
+            system_id = None
         device_name = nodes['snmp.device_name']
         internal_device_name = device_name
 
         model = "SGxxx"
         cluster = False
         cluster_nodes = 1
-        cluster_node_id = nodes['ha.node_id']
+       
+
         cluster_status = nodes['ha.status']
         cluster_mode = nodes['ha.mode']
         license = nodes['licensing.license']
         site_name = nodes['snmp.device_location']
-      
 
         if license:
             m = re_type_from_license.search(license)
@@ -206,99 +287,44 @@ class SophosUTMHandler(SourceBase):
             m = re_cluster_nodes_from_license.search(license)
             if m:
                 cluster_nodes = int(m.group(1))
-                if cluster_status == 'cluster' and  cluster_nodes > 1:
-                    cluster = True
+                if (cluster_status == 'cluster' or cluster_status == 'hot_standby') and  cluster_nodes > 1:
+                    self.is_cluster = True
+                    cluster_node_id = nodes['ha.node_id']
+                    if invert_cluster:
+                        if cluster_node_id == 1:
+                            cluster_node_id = 2
+                        else:
+                            cluster_node_id = 1
                     device_name = '{}({}/{})'.format(device_name,
                                                      cluster_node_id, cluster_nodes)
 
-        # if site_name == "" and 
-        if self.site_a != "" and self.site_b != "":
-            site_name =  [self.site_a, self.site_b ][((cluster_node_id-1) % 2)]
+                    # if site_name == "" and 
+                    if self.site_a != "" and self.site_b != "":
+                        site_name =  [self.site_a, self.site_b ][((cluster_node_id-1) % 2)]
 
-        self.site_object = None
+        self.nb_site = None
+        self.ensure_nb_objects(site_name)
 
-        site_data={
-        }
+        nb_device = None
+        if system_id:
+            nb_device = self.inventory.get_by_data(
+                NBDevice, data={"asset_tag": system_id})
 
-        if self.tenant_group:
-            self.tenant_group_object = self.inventory.get_by_data(
-                NBTenantGroup, data={"name": self.tenant_group})
-            if self.tenant_group_object is None and self.tenant_group and self.tenant_group != "":
-                self.tenant_group_object = self.inventory.add_update_object(
-                    NBTenantGroup, data={"name": self.tenant_group}, source=self)
-            if self.tenant_group_object:
-                site_data["tenant_group"] = self.tenant_group_object
-
-        if self.site_group:
-            self.site_group_object = self.inventory.get_by_data(
-                NBSiteGroup, data={"name": self.site_group})
-            if self.site_group_object is None and self.site_group and self.site_group != "":
-                self.site_group_object = self.inventory.add_update_object(
-                    NBSiteGroup, data={"name": self.site_group}, source=self)
-            if self.site_group_object:
-                site_data["group"] = self.site_group_object
-
-        if site_name:
-            site_data["name"] = site_name
-            self.site_object = self.inventory.get_by_data(
-                NBSite, data=site_data)
-            if self.site_object is None and site_name and site_name != "":
-                self.site_object = self.inventory.add_update_object(
-                    NBSite, data=site_data, source=self)
-
-        if self.site_a:
-            site_data["name"] = self.site_a
-            self.site_a_object = self.inventory.get_by_data(
-                NBSite, data=site_data)
-            if self.site_a_object is None:
-                self.site_a_object = self.inventory.add_update_object(
-                    NBSite, data=site_data, source=self)
-
-        if self.site_b:
-            site_data["name"] = self.site_b
-            self.site_b_object = self.inventory.get_by_data(
-                NBSite, data=site_data)
-            if self.site_b_object is None:
-                self.site_b_object = self.inventory.add_update_object(
-                    NBSite, data=site_data, source=self)
-
-        if self.site_floating:
-            site_data["name"] = self.site_floating
-            self.site_floating_object = self.inventory.get_by_data(
-                NBSite, data=site_data)
-            if self.site_floating_object is None:
-                self.site_floating_object = self.inventory.add_update_object(
-                    NBSite, data=site_data, source=self)
-
-        if self.site_spare:
-            site_data["name"] = self.site_spare
-            self.site_spare_object = self.inventory.get_by_data(
-                NBSite, data=site_data)
-            if self.site_spare_object is None:
-                self.site_spare_object = self.inventory.add_update_object(
-                    NBSite, data=site_data, source=self)
-
-        if system_id is None:
-            log.warn("Device has no System ID")
-            return None
-
-        self.device_object = self.inventory.get_by_data(
-            NBDevice, data={"asset_tag": system_id})
-        if self.device_object is None:
-            self.device_object = self.inventory.get_by_data(
-                NBDevice, data={"name": device_name, "site": self.site_object})
-        if self.device_object is None:
-            self.device_object = self.inventory.get_by_data(
-                NBDevice, data={"name": internal_device_name, "site": self.site_object})
-        if self.device_object is None:
-            self.device_object = self.inventory.get_by_data(
+        if nb_device is None:
+            nb_device = self.inventory.get_by_data(
+                NBDevice, data={"name": device_name, "site": self.nb_site})
+        if nb_device is None:
+            nb_device = self.inventory.get_by_data(
                 NBDevice, data={"display": device_name})
-        if self.device_object is None:
-            self.device_object = self.inventory.get_by_data(
+        if nb_device is None:
+            nb_device = self.inventory.get_by_data(
+                NBDevice, data={"name": internal_device_name, "site": self.nb_site})
+        if nb_device is None:
+            nb_device = self.inventory.get_by_data(
                 NBDevice, data={"display": internal_device_name})
 
-        if self.device_object:
-            device_name = grab(self.device_object, "data.name")
+        if nb_device:
+            device_name = grab(nb_device, "data.name")
 
         manufacturer_object = self.inventory.add_update_object(
             NBManufacturer, data={"name": "Sophos"},  source=self)
@@ -308,14 +334,14 @@ class SophosUTMHandler(SourceBase):
             NBDeviceType, data={"model": model, "manufacturer": manufacturer_object,},  source=self)
     
         if device_type_object:
-            site_name = grab(self.device_object, "data.site.data.name", fallback=site_name)
+            site_name = grab(nb_device, "data.site.data.name", fallback=site_name)
 
         device_data = {
             "name": device_name,
             "asset_tag": system_id,
         }
-        if cluster:
-            if cluster_mode == "master":
+        if self.is_cluster:
+            if cluster_mode == "master" and not invert_cluster:
                 device_data["status"] = "active"
             else:
                 device_data["status"] = "offline"
@@ -323,20 +349,19 @@ class SophosUTMHandler(SourceBase):
             device_data["status"] = "active"
 
 
-        if self.site_object:
-            device_data["site"] = self.site_object
+        if self.nb_site:
+            device_data["site"] = self.nb_site
         if role_object:
             device_data["device_role"] = role_object
         if device_type_object:
             device_data["device_type"] = device_type_object
 
-        device_data["primary_ip4"] =  self.inventory.add_update_object(NBIPAddress, data={"address": self.client.get_primary_address(), "vrf": self.vrf_object }, source=self)
+        if not invert_cluster:
+            device_data["primary_ip4"] =  self.inventory.add_update_object(NBIPAddress, data={"address": self.client.get_primary_address(), "vrf": self.nb_vrf }, source=self)
 
-        self.device_object = self.inventory.add_update_object(
-            NBDevice, data=device_data, read_from_netbox=False, source=self)
-
+        self.nb_device = self.inventory.add_update_object(
+            NBDevice, data=device_data,  read_from_netbox=(nb_device != None), source=self)
         
-        return self.device_object
 
     def resolve_tenant(self,candidate):
         """
@@ -344,15 +369,16 @@ class SophosUTMHandler(SourceBase):
         If non is found crate it. A company tenant group can optionally be created.
         """
         m = re_tenant.match(candidate)
+        tenant_group=None
         if m:
             tenant_data = {"slug": candidate }
-            if self.tenant_group_object:
-                tenant_group = self.tenant_group_object
+            if self.nb_tenant_group:
+                tenant_group = self.nb_tenant_group
                 if self.create_company_tenant_group:
-                    if m.group(1) == grab(self.tenant_group_object, "data.slug"):
-                        tenant_group =    self.tenant_group_object
+                    if m.group(1) == grab(self.nb_tenant_group, "data.slug"):
+                        tenant_group =    self.nb_tenant_group
                     else:
-                        tenant_group = self.inventory.add_update_object(NBTenantGroup, data={"name": m.group(1), "parent":self.tenant_group_object}, source=self)
+                        tenant_group = self.inventory.add_update_object(NBTenantGroup, data={"name": m.group(1), "parent":self.nb_tenant_group}, source=self)
             tenant_object = self.inventory.get_by_data(NBTenantGroup, data={"slug": candidate})
             if not tenant_object:
                 tenant_data["name"] = candidate
@@ -395,7 +421,7 @@ class SophosUTMHandler(SourceBase):
 
                 interface_data = {
                     "name":name,
-                    "device": self.device_object,
+                    "device": self.nb_device,
                     "label":hw,
                     "description": interface["description"],
                     "mac_address": interface["mac"].upper(),
@@ -405,7 +431,8 @@ class SophosUTMHandler(SourceBase):
                 }
                  
                 self.inventory.add_update_object(NBInterface, data=interface_data, source=self)
-    def add_addresse(self,nbinterface, address, nbvlan = None):
+    def add_interface_address(self,nbinterface, address, nbvlan = None):
+        
         ip4 = "{}/{}".format(address["address"],address["netmask"])
         self.add_prefix(nbinterface,  address["name"], ip4,nbvlan)
 
@@ -415,66 +442,84 @@ class SophosUTMHandler(SourceBase):
             "assigned_object_id": nbinterface,
             "description":  "gateway for {}".format(address["name"])
         }
+
         if "hostname" in address and address["hostname"] != "":
             address_data["dns_name"] = address["hostname"]
+
         return self.inventory.add_update_object(NBIPAddress, data=address_data, source=self)
 
     def add_prefix(self,nbinterface,name, ip4, nbvlan = None):
         # exanio specific 
-        if ip4.endswith("/22") and name.endswith("-transfer"):
-            parent_name = name[0:-9]
-            parent_ip4 = ip4[0:-1]+"0"
-            self.add_prefix(nbinterface,parent_name, parent_ip4, None)
+        parent = None
+        if ip4.endswith("/22"):
+            parts = name.split("-")
+            if len(parts) > 3:
+                if name.endswith("-transfer"):
+                    parent_name = name[0:-9]
+                    parent_ip4 = ip4[0:-1]+"0"
+                    self.add_prefix(nbinterface,parent_name, parent_ip4, None)
+
+                parts = name.split("-")
+                new_name = "-".join(parts[0:3])+"-"+parts[3][0]+"0"
+                parent_ip4 = ip4[0:-1]+"3"
+                self.add_prefix(nbinterface,new_name, parent_ip4, nbvlan)
 
         ip4net = IPv4Network(ip4, strict = False)
         prefix_data = {
             "prefix": ip4net,
             "site": None,
             "description": name,
-            "vrf": self.vrf_object,
+            "vrf": self.nb_vrf,
         }
+
+        if self.nb_site_group:
+            prefix_data["sitegroup"] = self.nb_site_group
+            
         tenant = grab(nbinterface, "data.tenant")
         if not tenant:
             tenant = self.resolve_tenant(name)
         if tenant:
             prefix_data["tenant"] = tenant
         else:
-            prefix_data["tenantgroup"] = self.tenant_group_object
+            prefix_data["tenantgroup"] = self.nb_tenant_group
 
         if (nbvlan):
             prefix_data["vlan"] = nbvlan
-        if self.site_group_object:
-            prefix_data["sitegroup"] = self.site_group_object
-        if self.site_floating_object:
-            
+        if self.nb_site_group:
+            prefix_data["sitegroup"] = self.nb_site_group
+        if self.nb_site_floating:
             m = re_address_name_zone.match(name)
             if m:
                 zone = m.group(3)
-                if zone == "1" and self.site_floating_object:
-                    prefix_data["site"] = self.site_floating_object
-                if zone == "2" and self.site_a_object:
-                    prefix_data["site"] = self.site_a_object
-                if zone == "3" and self.site_b_object:
-                    prefix_data["site"] = self.site_b_object
-                if zone == "4" and self.site_spare_object:
-                    prefix_data["site"] = self.site_spare_object
+                if zone == "0" and self.nb_site_floating:
+                    prefix_data["site"] = self.nb_site_floating
+                elif zone == "1" and self.nb_site_a:
+                    prefix_data["site"] = self.nb_site_a
+                elif zone == "2" and self.nb_site_b:
+                    prefix_data["site"] = self.nb_site_b
+                elif zone == "3" and self.nb_site_spare:
+                    prefix_data["site"] = self.nb_site_spare
+                elif zone == "4" and self.nb_site_spare:
+                    prefix_data["site"] = self.nb_site_spare
+                else:
+                    print(zone)
         else:
-            prefix_data["site"] = self.site_object
+            prefix_data["site"] = self.nb_site
         
-        self.inventory.add_update_object(NBPrefix, data=prefix_data, source=self)
+        return self.inventory.add_update_object(NBPrefix, data=prefix_data, source=self)
 
         
 
     def add_addresses(self,nbinterface, interface, nbvlan = None):
         if "primary_address_object" in interface:
             primary_address_object = interface["primary_address_object"]
-            self.add_addresse(nbinterface, primary_address_object, nbvlan)
+            self.add_interface_address(nbinterface, primary_address_object, nbvlan)
             # nbinterface.primary_ip4 = nbpimary_address
 
         if "additional_address_objects" in interface:
             additional_address_objects = interface["additional_address_objects"]
             for additional_address_object in additional_address_objects:
-                self.add_addresse(nbinterface, additional_address_object, nbvlan)
+                self.add_interface_address(nbinterface, additional_address_object, nbvlan)
 
 
     def update_ethernet_interfaces(self, all_interfaces):
@@ -492,7 +537,7 @@ class SophosUTMHandler(SourceBase):
                 interface_data = {
                     "name":interface_data["name"],
                     "enabled": interface["status"],
-                    "device": self.device_object,
+                    "device": self.nb_device,
                     "label":hw,
                     "description": interface["comment"],
                     "mac_address": ifhw["mac"].upper(),
@@ -501,7 +546,7 @@ class SophosUTMHandler(SourceBase):
                 }
                 if ifhw["vlantag"] != "":
                     interface_data["mode"] = "access"
-                    interface_data["untagged_vlan"] = self.inventory.add_update_object(NBVLAN, data={"vid": int(ifhw["vlantag"]), "name": ifhw["ssid"], "site": grab(self.device_object ,"data.site")  }, source=self)
+                    interface_data["untagged_vlan"] = self.inventory.add_update_object(NBVLAN, data={"vid": int(ifhw["vlantag"]), "name": ifhw["ssid"], "site": grab(self.nb_device ,"data.site")  }, source=self)
                     
                 nbinterface = self.inventory.add_update_object(NBInterface, data=interface_data, source=self)
                 self.add_addresses(nbinterface, interface)
@@ -521,7 +566,7 @@ class SophosUTMHandler(SourceBase):
 
                 interface_data = {
                     "name":name,
-                    "device": self.device_object,
+                    "device": self.nb_device,
                     "label":hw,
                     "description": interface["comment"],
                     "mac_address": ifhw["mac"].upper(),
@@ -546,7 +591,7 @@ class SophosUTMHandler(SourceBase):
                 interface_data = {
                     "name":name,
                     "label":hw,
-                    "device": self.device_object,
+                    "device": self.nb_device,
                     "description": interface["comment"],
                     "mac_address": ifhw["mac"].upper(),
                     "type": nic_type.get_common_type(),
@@ -557,21 +602,22 @@ class SophosUTMHandler(SourceBase):
                 if tenant_object:
                     interface["tenant"]: tenant_object
                 else:
-                    interface["tenantgrop"]: self.tenant_group_object
+                    interface["tenantgroup"]: self.nb_tenant_group
 
                 if interface["vlantag"] != "":
                     vlan_data = {"vid": int(interface["vlantag"]), "name": interface["name"] }
 
                     nbvlanlist = NBObjectList()
-                    if self.site_floating_object and self.site_group_object:
-                        vlan_data["sitegroup"]=self.site_group_object
-                    else:
-                        vlan_data["site"]=grab(self.device_object ,"data.site")
+                    
+
+                    if self.nb_site_group:
+                        vlan_data["sitegroup"]=self.nb_site_group
+                    if not self.nb_site_floating:
+                        vlan_data["site"]=grab(self.nb_device ,"data.site")
 
                     if tenant_object:
                         vlan_data["tenant"]: tenant_object
-                    else:
-                        vlan_data["tenantgrop"]: self.tenant_group_object
+                    vlan_data["tenantgroup"]: self.nb_tenant_group
 
                     nbvlan = self.inventory.add_update_object(NBVLAN, data = vlan_data, source=self)
                     nbvlanlist.append(nbvlan)
@@ -601,25 +647,39 @@ class SophosUTMHandler(SourceBase):
         self.update_hw_interfaces(all_interfaces)
         self.update_ethernet_interfaces(all_interfaces)
  
+    def get_fhrp(self):
+        return
+        if isinstance(self.nb_vrf, NBFHRPGroupItem):
+            return self.nb_fhrp
+        fhrp_data = {
+            "group_id": self.fhrp_id,
+            "description": "{} cluster addresses".grab(self.nb_device, "data.name")
+        }
+        self.nb_fhrp = self.inventory.add_object(
+            NBFHRPGroupItem, data=fhrp_data,  source=self)
+           
+        return self.nb_fhrp
+
 
     def get_vrf(self):
-        if isinstance(self.vrf_object, NBVRF):
-            return self.vrf_object
+        if isinstance(self.nb_vrf, NBVRF):
+            return self.nb_vrf
 
         if self.vrf is None:
             return None
         for vrf in self.inventory.get_all_items(NBVRF):
             if grab(vrf, "data.name") == self.vrf:
                 log.debug(f"vrf '{self.vrf}' was resolved")
-                self.vrf_object = vrf
-                return self.vrf_object
+                self.nb_vrf = vrf
+                return self.nb_vrf
 
         vrf_data = {
             "name": self.vrf
         }
-        self.vrf_object = self.inventory.add_object(
-            NBVRF, data=vrf_data, read_from_netbox=False, source=self)
-        return self.vrf_object
+        self.nb_vrf = self.inventory.add_object(
+            NBVRF, data=vrf_data, source=self)
+           
+        return self.nb_vrf
 
     def parse_config_settings(self, config_settings):
         """
@@ -646,3 +706,4 @@ class SophosUTMHandler(SourceBase):
 
         for setting in self.settings.keys():
             setattr(self, setting, config_settings.get(setting))
+

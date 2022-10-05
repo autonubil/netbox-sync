@@ -494,7 +494,11 @@ class NetBoxObject:
 
             # skip unset values
             if value is None:
-                log.info(f"Found unset key '{key}' while parsing {display_name}. Skipping This key")
+                # special handling for site and site group
+                if key == "site" and "sitegroup" in data and data["sitegroup"] != "":
+                    log.debug(f"Found unset key '{key}' but group is set")    
+                else:
+                    log.info(f"Found unset key '{key}' while parsing {display_name}. Skipping This key")
                 continue
 
             # check data model to see how we have to parse the value
@@ -1311,7 +1315,7 @@ class NBVLAN(NetBoxObject):
     primary_key = "vid"
     secondary_key = "name"
     enforce_secondary_key = True
-    prune = False
+    prune = True
 
     def __init__(self, *args, **kwargs):
         self.data_model = {
@@ -1396,7 +1400,7 @@ class NBPrefix(NetBoxObject):
             "site": NBSite,
             "sitegroup": NBSiteGroup,
             "tenant": NBTenant,
-            "tenangroup": NBTenantGroup,
+            "tenantgroup": NBTenantGroup,
             "vlan": NBVLAN,
             "vrf": NBVRF,
             "description": 200,
@@ -1538,6 +1542,7 @@ class NBCluster(NetBoxObject):
             "tenant": NBTenant,
             "group": NBClusterGroup,
             "site": NBSite,
+            "sitegroup": NBSiteGroup,
             "tags": NBTagList
         }
         super().__init__(*args, **kwargs)
@@ -1560,6 +1565,7 @@ class NBDevice(NetBoxObject):
             "platform": NBPlatform,
             "serial": 50,
             "site": NBSite,
+            "sitegroup": NBSiteGroup,
             "status": ["offline", "active", "planned", "staged", "failed", "inventory", "decommissioning"],
             "cluster": NBCluster,
             "asset_tag": 50,
@@ -1593,6 +1599,7 @@ class NBVM(NetBoxObject):
             "primary_ip4": NBIPAddress,
             "primary_ip6": NBIPAddress,
             "site": NBSite,
+            "sitegroup": NBSiteGroup,
             "tags": NBTagList,
             "tenant": NBTenant,
             "custom_fields": NBCustomField
@@ -1756,13 +1763,12 @@ class NBIPAddress(NetBoxObject):
 
 class NBFHRPGroupItem(NetBoxObject):
     """
-        This object is currently not used directly in any class.
-        It is used to handle IP address object properly.
+        Used for Sophos Cluster IPs
     """
     name = "FHRP group"
     api_path = "/ipam/fhrp-groups"
     primary_key = "group_id"
-    prune = False
+    prune = True
 
     def __init__(self, *args, **kwargs):
         self.data_model = {
