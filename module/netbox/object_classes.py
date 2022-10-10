@@ -1309,6 +1309,26 @@ class NBVRF(NetBoxObject):
         super().__init__(*args, **kwargs)
 
 
+class NBVLANGroup(NetBoxObject):
+    name = "VLANGroup"
+    api_path = "ipam/vlan-groups"
+    primary_key = "name"
+    prune = False
+
+    def __init__(self, *args, **kwargs):
+        self.data_model = {
+            "name": 100,
+            "slug": 100,
+            "description": 200,
+            "min_vid": int,
+            "max_vid": int,
+            "scope_id": NetBoxObject,
+            "scope_type": ["dcim.location", "dcim.rack", "dcim.region", "dcim.site", "dcim.sitegroup", "virtualization.cluster", "virtualization.clustergroup"],
+            "tags": NBTagList
+        }
+        super().__init__(*args, **kwargs)
+
+
 class NBVLAN(NetBoxObject):
     name = "VLAN"
     api_path = "ipam/vlans"
@@ -1322,7 +1342,7 @@ class NBVLAN(NetBoxObject):
             "vid": int,
             "name": 64,
             "site": NBSite,
-            "sitegroup": NBSiteGroup,
+            "group": NBVLANGroup,
             "description": 200,
             "tenant": NBTenant,
             "tags": NBTagList
@@ -1599,7 +1619,6 @@ class NBVM(NetBoxObject):
             "primary_ip4": NBIPAddress,
             "primary_ip6": NBIPAddress,
             "site": NBSite,
-            "sitegroup": NBSiteGroup,
             "tags": NBTagList,
             "tenant": NBTenant,
             "custom_fields": NBCustomField

@@ -38,14 +38,13 @@ from module.netbox.object_classes import (
     NBSiteGroup,
     NBCluster,
     NBDevice,
-    NBVM,
-    NBVMInterface,
     NBInterface,
     NBIPAddress,
     NBPrefix,
     NBTenant,
     NBTenantGroup,
     NBVRF,
+    NBVLANGroup,
     NBVLAN,
     NBCustomField
 )
@@ -78,14 +77,13 @@ class SophosUTMHandler(SourceBase):
         NBSiteGroup,
         NBCluster,
         NBDevice,
-        NBVM,
-        NBVMInterface,
         NBInterface,
         NBIPAddress,
         NBPrefix,
         NBTenant,
         NBTenantGroup,
         NBVRF,
+        NBVLANGroup,
         NBVLAN,
         NBCustomField
     ]
@@ -101,6 +99,7 @@ class SophosUTMHandler(SourceBase):
         "proxy_port": None,
         "vrf": None,
         "site_group": None,
+        "group_vlans": None,
         "site_a": None,
         "site_b": None,
         "site_floating": None,
@@ -127,6 +126,7 @@ class SophosUTMHandler(SourceBase):
     is_cluster = False
 
     site_group= None
+    group_vlans = None
     site_a=None
     site_b=None
     site_floating=None
@@ -546,7 +546,8 @@ class SophosUTMHandler(SourceBase):
                 }
                 if ifhw["vlantag"] != "":
                     interface_data["mode"] = "access"
-                    interface_data["untagged_vlan"] = self.inventory.add_update_object(NBVLAN, data={"vid": int(ifhw["vlantag"]), "name": ifhw["ssid"], "site": grab(self.nb_device ,"data.site")  }, source=self)
+                    vlan_data = self.associate_vlan({"vid": int(ifhw["vlantag"]), "name": ifhw["ssid"]  },  {"site": grab(self.nb_device ,"data.site")} )
+                    interface_data["untagged_vlan"] = self.inventory.add_update_object(NBVLAN,vlan_data , source=self)
                     
                 nbinterface = self.inventory.add_update_object(NBInterface, data=interface_data, source=self)
                 self.add_addresses(nbinterface, interface)
@@ -609,16 +610,17 @@ class SophosUTMHandler(SourceBase):
 
                     nbvlanlist = NBObjectList()
                     
-
+                    site_data = {}
                     if self.nb_site_group:
-                        vlan_data["sitegroup"]=self.nb_site_group
+                        site_data["sitegroup"]=self.nb_site_group
                     if not self.nb_site_floating:
-                        vlan_data["site"]=grab(self.nb_device ,"data.site")
+                        site_data["site"]=grab(self.nb_device ,"data.site")
 
                     if tenant_object:
                         vlan_data["tenant"]: tenant_object
                     vlan_data["tenantgroup"]: self.nb_tenant_group
 
+                    vlan_data = self.associate_vlan(vlan_data, site_data)
                     nbvlan = self.inventory.add_update_object(NBVLAN, data = vlan_data, source=self)
                     nbvlanlist.append(nbvlan)
 
