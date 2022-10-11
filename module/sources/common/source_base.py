@@ -18,13 +18,16 @@ from module.netbox.inventory import (
     NBInterface,
     NBVMInterface,
     NBSite,
+    NBSiteGroup,
     NBPrefix,
     NBIPAddress,
+    NBVLANGroup,
     NBVLAN,
     NBCustomField
 )
 from module.common.logging import get_logger
 from module.common.misc import grab
+from module.netbox.object_classes import NBSiteGroup
 
 log = get_logger()
 
@@ -677,5 +680,49 @@ class SourceBase:
             custom_field.update(data={"content_types": data.get("content_types")}, source=self)
 
         return custom_field
+
+
+    def get_value(self, names ):
+        for name in names:
+            attr = getattr(self, name, None)
+            if attr:
+                if callable(attr):
+                    return attr(self)
+                else:
+                    return attr
+
+    def resolve_vlan_group(self):
+        if not hasattr(self, "group_vlans"): 
+            return None
+        parent = None
+        match self.group_vlans:
+            case "dcim.sitegroup":
+                test = self.get_value(["nb_site_group", "get_sitegroup", "sitegroup"] )
+                if test and test.__class__ == NBSiteGroup:
+                    parent = test
+            case "dcim.site":
+                test = self.get_value(["nb_site", "get_site", "site"] )
+                if test and test.__class__ == NBSite:
+                    parent = test
+                    
+        if parent == None:
+            return None
+
+        vlan_group = self.inventory.get_by_data(NBVLANGroup, { "scope_type": self.group_vlans, "scope_id": parent })
+        if not vlan_group:
+            vlan_group = self.inventory.add_update_object(NBVLANGroup, { "name": grab(parent, "data.name"),  "min_vid":1, "max_vid": 4094,  "scope_type": self.group_vlans, "scope_id": parent })
+        
+        return vlan_group
+
+
+    def associate_vlan(self, vlan_data,site):
+        group = self.resolve_vlan_group()
+        if group:
+            vlan_data["group"] = group
+            vlan_data["site"] = None
+        elif site:
+            vlan_data["site"] = site
+        return vlan_data
+
 
 # EOF

@@ -31,6 +31,7 @@ from module.common.logging import get_logger, DEBUG3
 from module.common.misc import grab, dump, get_string_or_none, plural, quoted_split
 from module.common.support import normalize_mac_address, ip_valid_to_add_to_netbox
 from module.netbox.object_classes import (
+    NBTenantGroup,
     NetBoxInterfaceType,
     NBTag,
     NBManufacturer,
@@ -51,8 +52,11 @@ from module.netbox.object_classes import (
     NBTenant,
     NBVRF,
     NBVLAN,
+    NBVLANGroup,
     NBCustomField
 )
+
+re_match_replace = re.compile('\$(\d)')
 
 vsphere_automation_sdk_available = True
 try:
@@ -92,6 +96,7 @@ class VMWareHandler(SourceBase):
         NBTenant,
         NBVRF,
         NBVLAN,
+        NBVLANGroup,
         NBCustomField
     ]
 
@@ -145,6 +150,7 @@ class VMWareHandler(SourceBase):
         "host_management_interface_match": "management, mgmt",
         "ip_tenant_inheritance_order": "device, prefix",
         "site_group": None,
+        "group_vlans": None,
     }
 
     deprecated_settings = {}
@@ -171,6 +177,7 @@ class VMWareHandler(SourceBase):
     site_name = None
 
     site_group= None
+    group_vlans = None
     nb_site_group= None
 
     def __init__(self, name=None, settings=None, inventory=None):
@@ -189,14 +196,6 @@ class VMWareHandler(SourceBase):
         if self.enabled is False:
             log.info(f"Source '{name}' is currently disabled. Skipping")
             return
-
-
-        if self.site_group and not self.nb_site_group:
-            self.nb_site_group = self.inventory.get_by_data(
-                NBSiteGroup, data={"name": self.site_group})
-            if self.nb_site_group is None and self.site_group and self.site_group != "":
-                self.nb_site_group = self.inventory.add_update_object(
-                    NBSiteGroup, data={"name": self.site_group}, source=self)
 
         self.create_sdk_session()
 
@@ -541,6 +540,17 @@ class VMWareHandler(SourceBase):
             },
 
         """
+
+
+
+
+        if self.site_group and not self.nb_site_group:
+            self.nb_site_group = self.inventory.get_by_data(
+                NBSiteGroup, data={"name": self.site_group})
+            if self.nb_site_group is None and self.site_group and self.site_group != "":
+                self.nb_site_group = self.inventory.add_update_object(
+                    NBSiteGroup, data={"name": self.site_group}, source=self)
+
         object_mapping = {
             "datacenter": {
                 "view_type": vim.Datacenter,
@@ -1116,8 +1126,10 @@ class VMWareHandler(SourceBase):
         for single_relation in grab(self, relation, fallback=list()):
             object_regex = single_relation.get("object_regex")
             match_found = False
-            if object_regex.match(name):
+            m = object_regex.match(name)
+            if m:
                 resolved_name = single_relation.get("assigned_name")
+                resolved_name = re_match_replace.sub( lambda msub : m.group( int (msub.group(1))),resolved_name )
                 log.debug2(f"Found a matching {relation} '{resolved_name}' ({object_regex.pattern}) for {name}")
                 resolved_list.append(resolved_name)
                 match_found = True
@@ -1521,8 +1533,8 @@ class VMWareHandler(SourceBase):
         }
         if self.nb_site_group:
             data["sitegroup"] = self.nb_site_group
-        else:
-            data["site"] =  {"name": site_name}
+        
+        data["site"] =  {"name": site_name}
 
         tenant_name = self.get_object_relation(full_cluster_name, "cluster_tenant_relation")
         if tenant_name is not None:
@@ -1991,14 +2003,9 @@ class VMWareHandler(SourceBase):
 
                     vlan_data = {
                             "name": pnic_vlan.get("name"),
-                            "vid": pnic_vlan.get("vid"),
-                            "site": {
-                                "name": site_name
-                            }
+                            "vid": pnic_vlan.get("vid")
                         }
-                    if self.nb_site_group:
-                        vlan_data["sitegroup"] = self.nb_site_group
-
+                    vlan_data = self.associate_vlan(vlan_data, {"site": {"name": site_name}} )
                     tagged_vlan_list.append(vlan_data)
 
                 if len(tagged_vlan_list) > 0:
@@ -2087,12 +2094,9 @@ class VMWareHandler(SourceBase):
                 vnic_data["untagged_vlan"] = {
                     "name": unquote(f"ESXi {vnic_portgroup} (ID: {vnic_portgroup_vlan_id}) ({site_name})"),
                     "vid": vnic_portgroup_vlan_id,
-                    "site": {
-                        "name": site_name
-                    }
+                    
                 }
-                if self.nb_site_group:
-                    vnic_data["untagged_vlan"]["sitegroup"] = self.nb_site_group
+                vnic_data["untagged_vlan"] = self.associate_vlan(vnic_data["untagged_vlan"], {"site": {"name": site_name}} )
 
             elif vnic_dv_portgroup_data is not None:
 
@@ -2107,14 +2111,10 @@ class VMWareHandler(SourceBase):
 
                     tagged_vlan_data = {
                             "name": unquote(f"{vnic_dv_portgroup_data.get('name')}-{vnic_dv_portgroup_data_vlan_id}"),
-                            "vid": vnic_dv_portgroup_data_vlan_id,
-                            "site": {
-                                "name": site_name
-                            }
+                            "vid": vnic_dv_portgroup_data_vlan_id
                         }
-                    if self.nb_site_group:
-                        tagged_vlan_data["sitegroup"] = self.nb_site_group
 
+                    tagged_vlan_data = self.associate_vlan(tagged_vlan_data, {"site": {"name": site_name}} )
                     tagged_vlan_list.append(tagged_vlan_data)
 
                 if len(tagged_vlan_list) > 0:
@@ -2318,8 +2318,6 @@ class VMWareHandler(SourceBase):
         # Add adaption for change in NetBox 3.3.0 VM model
         # issue: https://github.com/netbox-community/netbox/issues/10131#issuecomment-1225783758
         if version.parse(self.inventory.netbox_api_version) >= version.parse("3.3.0"):
-            if self.nb_site_group:
-                vm_data["sitegroup"] = self.nb_site_group
             vm_data["site"] = {"name": site_name}
 
         if platform is not None:
@@ -2520,13 +2518,9 @@ class VMWareHandler(SourceBase):
 
                     vm_nic_data["untagged_vlan"] = {
                         "name": unquote(int_network_name),
-                        "vid": int_network_vlan_ids[0],
-                        "site": {
-                            "name": site_name
-                        }
+                        "vid": int_network_vlan_ids[0]
                     }
-                    if self.nb_site_group: 
-                        vm_nic_data["untagged_vlan"]["sitegroup"] = self.nb_site_group
+                    vm_nic_data["untagged_vlan"] = self.associate_vlan(vm_nic_data["untagged_vlan"],  {"site": {"name": site_name}} )
                 else:
                     tagged_vlan_list = list()
                     for int_network_vlan_id in int_network_vlan_ids:
@@ -2536,14 +2530,9 @@ class VMWareHandler(SourceBase):
 
                         tagged_vlan_data = {
                             "name": unquote(f"{int_network_name}-{int_network_vlan_id}"),
-                            "vid": int_network_vlan_id,
-                            "site": {
-                                "name": site_name
-                            }
+                            "vid": int_network_vlan_id
                         }
-                        if self.nb_site_group: 
-                            tagged_vlan_data["sitegroup"] = self.nb_site_group
-
+                        tagged_vlan_data  = self.associate_vlan(tagged_vlan_data, {"site": {"name": site_name}} )
                         tagged_vlan_list.append(tagged_vlan_data)
 
                     if len(tagged_vlan_list) > 0:
