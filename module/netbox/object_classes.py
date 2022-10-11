@@ -1223,6 +1223,9 @@ class NBTagList(NBObjectList):
         return return_list
 
 
+
+
+
 class NBTenant(NetBoxObject):
     name = "tenant"
     api_path = "tenancy/tenants"
@@ -1398,7 +1401,7 @@ class NBPrefix(NetBoxObject):
         self.data_model = {
             "prefix": [IPv4Network, IPv6Network,str],
             "site": NBSite,
-            "sitegroup": NBSiteGroup,
+            # "sitegroup": NBSiteGroup,
             "tenant": NBTenant,
             "tenantgroup": NBTenantGroup,
             "vlan": NBVLAN,
@@ -1760,6 +1763,24 @@ class NBIPAddress(NetBoxObject):
         elif isinstance(o_interface, NBVMInterface):
             return o_interface.data.get("virtual_machine")
 
+class NBIPAddressList(NBObjectList):
+    member_type = NBIPAddress
+
+    def get_nb_reference(self):
+        """
+            return None if one address is unresolvable
+
+            Once the address was created in NetBox it can be assigned to objects
+        """
+        return_list = list()
+        for address in self:
+            if address.nb_id == 0:
+                return None
+
+            return_list.append(address.nb_id)
+
+        return return_list
+
 
 class NBFHRPGroupItem(NetBoxObject):
     """
@@ -1767,16 +1788,38 @@ class NBFHRPGroupItem(NetBoxObject):
     """
     name = "FHRP group"
     api_path = "/ipam/fhrp-groups"
-    primary_key = "group_id"
+    primary_key = "description"
     prune = True
 
     def __init__(self, *args, **kwargs):
         self.data_model = {
             "group_id": int,
-            "ip_addresses": NBIPAddress,
+            "ip_addresses": NBIPAddressList,
             "description": 200,
+            "protocol": 200,
             "tags": NBTagList,
             "custom_fields": NBCustomField
+        }
+        super().__init__(*args, **kwargs)
+
+
+class NBFHRPGroupAssignment(NetBoxObject):
+    """
+        Used for Sophos Cluster IPs
+    """
+    name = "FHRP group assignments"
+    api_path = "/ipam/fhrp-group-assignments"
+    primary_key = "group"
+    secondary_key = "interface_id"
+    enforce_secondary_key = True
+    prune = True
+
+    def __init__(self, *args, **kwargs):
+        self.data_model = {
+            "group": NBFHRPGroupItem,
+            "interface_id": NBInterface,
+            "interface_type": 100,
+            "priority": id
         }
         super().__init__(*args, **kwargs)
 
