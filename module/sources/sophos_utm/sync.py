@@ -146,8 +146,8 @@ class SophosUTMHandler(SourceBase):
     nb_site_floating=None
     nb_site_spare=None
     nb_tenant_group=None
-    nb_fhrp = None
-
+    is_active_active = False
+    internal_device_name = "Sophos"
 
     def __init__(self, name=None, settings=None, inventory=None):
 
@@ -267,7 +267,7 @@ class SophosUTMHandler(SourceBase):
         else:
             system_id = None
         device_name = nodes['snmp.device_name']
-        internal_device_name = device_name
+        self.internal_device_name = device_name
 
         model = "SGxxx"
         cluster = False
@@ -317,10 +317,10 @@ class SophosUTMHandler(SourceBase):
                 NBDevice, data={"display": device_name})
         if nb_device is None:
             nb_device = self.inventory.get_by_data(
-                NBDevice, data={"name": internal_device_name, "site": self.nb_site})
+                NBDevice, data={"name": self.internal_device_name, "site": self.nb_site})
         if nb_device is None:
             nb_device = self.inventory.get_by_data(
-                NBDevice, data={"display": internal_device_name})
+                NBDevice, data={"display": self.internal_device_name})
 
         if nb_device:
             device_name = grab(nb_device, "data.name")
@@ -342,14 +342,7 @@ class SophosUTMHandler(SourceBase):
         if self.is_cluster:
             if cluster_mode == "master" and not invert_cluster and not cluster_status == 'hot_standby':
                 device_data["status"] = "active"
-                fhrp_data = {
-                    "group_id": self.fhrp_id,
-                    "ip_addresses": [],
-                    "protocol": "vrrp2",
-                    "description": "{} cluster addresses".format(internal_device_name)
-                }
-                self.nb_fhrp = self.inventory.add_object(
-                    NBFHRPGroupItem, data=fhrp_data,  source=self)
+                self.is_active_active = True
             else:
                 if cluster_status == 'cluster':
                     device_data["status"] = "active"
@@ -367,7 +360,7 @@ class SophosUTMHandler(SourceBase):
             device_data["device_type"] = device_type_object
 
         if not invert_cluster:
-            if not self.nb_fhrp:
+            if not self.is_active_active:
                 device_data["primary_ip4"] =  self.inventory.add_update_object(NBIPAddress, data={"address": self.client.get_primary_address(), "vrf": self.nb_vrf }, source=self)
 
         self.nb_device = self.inventory.add_update_object(
@@ -419,7 +412,7 @@ class SophosUTMHandler(SourceBase):
     def update_hw_interfaces(self, all_interfaces):
         for interface in all_interfaces:
             if interface["_type"] == 'itfhw/ethernet':
-                name = interface["name"]
+                name = interface["name"].strip()
                 hw =interface["hardware"]
                 nic_type = NetBoxInterfaceType('other')
                 types = interface["supported_link_modes"].split(',')
@@ -440,8 +433,8 @@ class SophosUTMHandler(SourceBase):
                     "speed": int(interface["speed"])*1000,
                     "type": nic_type.get_common_type(),
                 }
-                 
                 self.inventory.add_update_object(NBInterface, data=interface_data, source=self)
+
     def add_interface_address(self,nbinterface, address, nbvlan = None):
         
         ip4 = "{}/{}".format(address["address"],address["netmask"])
@@ -452,9 +445,9 @@ class SophosUTMHandler(SourceBase):
             "description":  "gateway for {}".format(address["name"])
         }
 
-        if self.nb_fhrp:
+        if self.is_active_active:
             address_data["assigned_object_type"]= "ipam.fhrpgroup"
-            address_data["assigned_object_id"]= self.nb_fhrp
+            address_data["assigned_object_id"]= self.get_fhrp(nbinterface)
         else:
             address_data["assigned_object_type"]= "dcim.interface"
             address_data["assigned_object_id"]= nbinterface
@@ -473,7 +466,7 @@ class SophosUTMHandler(SourceBase):
                 if name.endswith("-transfer"):
                     parent_name = name[0:-9]
                     parent_ip4 = ip4[0:-1]+"0"
-                    self.add_prefix(nbinterface,parent_name, parent_ip4, None)
+                    self.add_prefix(nbinterface, parent_name, parent_ip4, None)
 
                 parts = name.split("-")
                 new_name = "-".join(parts[0:3])+"-"+parts[3][0]+"0"
@@ -521,15 +514,25 @@ class SophosUTMHandler(SourceBase):
         
         return self.inventory.add_update_object(NBPrefix, data=prefix_data, source=self)
 
-        
+    def get_fhrp(self, nbinterface):
+        fhrp_data = {
+                "group_id": self.fhrp_id,
+                "ip_addresses": [],
+                "protocol": "vrrp2",
+                "description": "{} cluster addresses for {}".format(self.internal_device_name, grab(nbinterface, "data.label"))
+            }
+        return self.inventory.add_update_object(
+            NBFHRPGroupItem, data=fhrp_data,  source=self)
+
 
     def add_addresses(self,nbinterface, interface, nbvlan = None):
         if "primary_address_object" in interface:
             primary_address_object = interface["primary_address_object"]
             ipaddress = self.add_interface_address(nbinterface, primary_address_object, nbvlan)
-            if self.nb_fhrp:
-                self.nb_fhrp.data["ip_addresses"].append(ipaddress)
-                self.inventory.add_update_object(NBFHRPGroupAssignment, data={ "group": self.nb_fhrp, "interface_id": nbinterface, "priority": 10, "interface_type": "dcim.interface" }, source=self)
+            if self.is_active_active:
+                fhrp = self.get_fhrp(nbinterface)
+                grab(fhrp,"data.ip_addresses").append(ipaddress)
+                self.inventory.add_update_object(NBFHRPGroupAssignment, data={ "group": fhrp, "interface_id": nbinterface, "priority": 10, "interface_type": "dcim.interface" }, source=self)
 
             # nbinterface.primary_ip4 = nbpimary_address
 
@@ -537,9 +540,10 @@ class SophosUTMHandler(SourceBase):
             additional_address_objects = interface["additional_address_objects"]
             for additional_address_object in additional_address_objects:
                 ipaddress =  self.add_interface_address(nbinterface, additional_address_object, nbvlan)
-                if self.nb_fhrp:
-                    grab(self.nb_fhrp,"data.ip_addresses").append(ipaddress)
-                    self.inventory.add_update_object(NBFHRPGroupAssignment, data={ "group": self.nb_fhrp, "interface_id": nbinterface, "priority": 10, "interface_type": "dcim.interface" }, source=self)
+                if self.is_active_active:
+                    fhrp = self.get_fhrp(nbinterface)
+                    grab(fhrp,"data.ip_addresses").append(ipaddress)
+                    self.inventory.add_update_object(NBFHRPGroupAssignment, data={ "group": fhrp, "interface_id": nbinterface, "priority": 10, "interface_type": "dcim.interface" }, source=self)
 
 
     def update_ethernet_interfaces(self, all_interfaces):
@@ -567,7 +571,7 @@ class SophosUTMHandler(SourceBase):
                 if ifhw["vlantag"] != "":
                     interface_data["mode"] = "access"
                     vlan_data = self.associate_vlan({"vid": int(ifhw["vlantag"]), "name": ifhw["ssid"]  },  {"site": grab(self.nb_device ,"data.site")} )
-                    interface_data["untagged_vlan"] = self.inventory.add_update_object(NBVLAN,vlan_data , source=self)
+                    interface_data["untagged_vlan"] = self.inventory.add_update_object(NBVLAN, vlan_data, source=self)
                     
                 nbinterface = self.inventory.add_update_object(NBInterface, data=interface_data, source=self)
                 self.add_addresses(nbinterface, interface)
