@@ -240,3 +240,11 @@ by different NetBox objects
 >You can check out the full license [here](https://github.com/bb-Ricardo/netbox-sync/blob/main/LICENSE.txt)
 
 This project is licensed under the terms of the **MIT** license.
+
+
+## Changes
+
+- Support for Sophos
+- `vm_tenant_relation` can now use a regex group in target
+- new config option `site_group` -> use a sitegroup if a site can not be determined
+- new config option `group_vlans` -> if true, VLans will be grouped by site(group)

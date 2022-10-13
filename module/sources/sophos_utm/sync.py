@@ -57,7 +57,7 @@ re_cluster_nodes_from_license = re.compile(
     '^ClusterNodes\s=\s(\d+)$', re.MULTILINE)
 
 re_address_name_group = re.compile('^([a-z]{2,}\-[a-z]{2,}\-[a-z]{2,})\-([a-z]+)$')
-re_address_name_zone = re.compile('^([a-z]{2,}\-[a-z]{2,}\-[a-z]{2,})\-([a-z]+)(\d)(\-[a-z]+)?$')
+re_address_name_zone = re.compile('^([a-z]{2,}\-[a-z]{2,}\-[a-z]{2,})\-([a-z0-9]+)(\d)(\-[a-z0-9]+)?$')
 re_tenant = re.compile('^([a-z]{2,})\-([a-z]{2,})\-([a-z]{2,})$')
 
 
@@ -124,7 +124,6 @@ class SophosUTMHandler(SourceBase):
     client = SophosUTMClient
     vrf = None
     raw_interfaces = {}
-    is_cluster = False
 
     site_group= None
     group_vlans = None
@@ -146,6 +145,7 @@ class SophosUTMHandler(SourceBase):
     nb_site_floating=None
     nb_site_spare=None
     nb_tenant_group=None
+    is_cluster = False
     is_active_active = False
     internal_device_name = "Sophos"
 
