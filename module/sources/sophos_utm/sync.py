@@ -82,6 +82,8 @@ class SophosUTMHandler(SourceBase):
         NBIPAddress,
         NBPrefix,
         NBTenant,
+        NBFHRPGroupItem,
+        NBFHRPGroupAssignment,
         NBTenantGroup,
         NBVRF,
         NBVLANGroup,
@@ -191,8 +193,8 @@ class SophosUTMHandler(SourceBase):
             if self.is_cluster and self.cluster_sync:
                 self.nb_device = None
                 self.get_device(True)
-            if self.nb_device:
-                self.update_interfaces()
+                if self.nb_device:
+                    self.update_interfaces()
 
     def ensure_nb_objects(self, site_name):
         
@@ -262,18 +264,13 @@ class SophosUTMHandler(SourceBase):
             return self.nb_device
 
         nodes = self.client.get_nodes()
-        if not invert_cluster:
-            system_id = nodes['settings.system_id']
-        else:
-            system_id = None
+        
         device_name = nodes['snmp.device_name']
         self.internal_device_name = device_name
 
         model = "SGxxx"
-        cluster = False
-        cluster_nodes = 1
-       
 
+        cluster_nodes = 1
         cluster_status = nodes['ha.status']
         cluster_mode = nodes['ha.mode']
         license = nodes['licensing.license']
@@ -305,10 +302,6 @@ class SophosUTMHandler(SourceBase):
         self.ensure_nb_objects(site_name)
 
         nb_device = None
-        if system_id:
-            nb_device = self.inventory.get_by_data(
-                NBDevice, data={"asset_tag": system_id})
-
         if nb_device is None:
             nb_device = self.inventory.get_by_data(
                 NBDevice, data={"name": device_name, "site": self.nb_site})
@@ -334,20 +327,20 @@ class SophosUTMHandler(SourceBase):
     
         if device_type_object:
             site_name = grab(nb_device, "data.site.data.name", fallback=site_name)
-
         device_data = {
             "name": device_name,
-            "asset_tag": system_id,
         }
+        self.is_active_active = False
         if self.is_cluster:
-            if cluster_mode == "master" and not invert_cluster and not cluster_status == 'hot_standby':
-                device_data["status"] = "active"
+            if cluster_mode == "master" and not cluster_status == 'hot_standby':
                 self.is_active_active = True
+                device_data["status"] = "active"
             else:
                 if cluster_status == 'cluster':
                     device_data["status"] = "active"
-                if cluster_status == 'hot_standby':
+                if cluster_status == 'hot_standby' and invert_cluster:
                     device_data["status"] = "offline"
+                
         else:
             device_data["status"] = "active"
 
@@ -412,8 +405,8 @@ class SophosUTMHandler(SourceBase):
     def update_hw_interfaces(self, all_interfaces):
         for interface in all_interfaces:
             if interface["_type"] == 'itfhw/ethernet':
-                name = interface["name"].strip()
                 hw =interface["hardware"]
+                name = "{}@{}".format(hw, grab(self.nb_device, "data.name"))
                 nic_type = NetBoxInterfaceType('other')
                 types = interface["supported_link_modes"].split(',')
                 for test_type in types:

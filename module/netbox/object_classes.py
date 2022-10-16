@@ -1808,6 +1808,8 @@ class NBFHRPGroupItem(NetBoxObject):
     name = "FHRP group"
     api_path = "/ipam/fhrp-groups"
     primary_key = "description"
+    secondary_key = "group_id"
+    enforce_secondary_key = True
     prune = True
 
     def __init__(self, *args, **kwargs):
