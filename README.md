@@ -38,6 +38,7 @@ This ensures stale objects are removed from NetBox keeping an accurate current s
 * pyvmomi==7.0.3
 * aiodns==2.0.0
 * setuptools>=62.00.0
+* pyyaml==6.0
 
 ### Environment
 * NetBox >= 2.9
@@ -56,7 +57,7 @@ This ensures stale objects are removed from NetBox keeping an accurate current s
 yum install python36-pip
 ```
 
-## Ubuntu 18.04 & 20.04
+## Ubuntu 18.04 & 20.04 && 22.04
 ```shell
 apt-get update && apt-get install python3-venv
 ```
@@ -82,6 +83,137 @@ The `vsphere-automation-sdk` must be installed if tags should be synced from vCe
 pip install --upgrade git+https://github.com/vmware/vsphere-automation-sdk-python.git
 ```
 
+## NetBox API token
+In order to updated data in NetBox you need a NetBox API token.
+* API token with all permissions (read, write) except:
+  * auth
+  * secrets
+  * users
+
+A short description can be found [here](https://docs.netbox.dev/en/stable/integrations/rest-api/#authentication)
+
+# Running the script
+
+```
+usage: netbox-sync.py [-h] [-c settings.ini [settings.ini ...]] [-g]
+                      [-l {DEBUG3,DEBUG2,DEBUG,INFO,WARNING,ERROR}] [-n] [-p]
+
+Sync objects from various sources to NetBox
+
+Version: 1.4.2 (2023-04-24)
+Project URL: https://github.com/bb-ricardo/netbox-sync
+
+options:
+  -h, --help            show this help message and exit
+  -c settings.ini [settings.ini ...], --config settings.ini [settings.ini ...]
+                        points to the config file to read config data from
+                        which is not installed under the default path
+                        './settings.ini'
+  -g, --generate_config
+                        generates default config file.
+  -l {DEBUG3,DEBUG2,DEBUG,INFO,WARNING,ERROR}, --log_level {DEBUG3,DEBUG2,DEBUG,INFO,WARNING,ERROR}
+                        set log level (overrides config)
+  -n, --dry_run         Operate as usual but don't change anything in NetBox.
+                        Great if you want to test and see what would be
+                        changed.
+  -p, --purge           Remove (almost) all synced objects which were create
+                        by this script. This is helpful if you want to start
+                        fresh or stop using this script.
+```
+
+## TESTING
+It is recommended to set log level to `DEBUG2` this way the program should tell you what is happening and why.
+Also use the dry run option `-n` at the beginning to avoid changes directly in NetBox.
+
+## Configuration
+There are two ways to define configuration. Any combination of config file(s) and environment variables is possible.
+* config files (the [default config](https://github.com/bb-Ricardo/netbox-sync/blob/main/settings-example.ini) file name is set to `./settings.ini`.)
+* environment variables
+
+The config from the environment variables will have precedence over the config file definitions.
+
+### Config files
+Following config file types are supported:
+* ini
+* yaml
+
+There is also more than one config file permitted. Example (config file names are also just examples):
+```bash
+/opt/netbox-sync/netbox-sync.py -c common.ini all-sources.yaml additional-config.yaml
+```
+
+All files are parsed in order of the definition and options will overwrite the same options if defined in a
+previous config file.
+
+To get config file examples which include descriptions and all default values, the `-g` can be used:
+```bash
+# this will create an ini example
+/opt/netbox-sync/netbox-sync.py -g -c settings-example.ini
+
+# and this will create an example config file in yaml format
+/opt/netbox-sync/netbox-sync.py -g -c settings-example.yaml 
+```
+
+### Environment variables
+Each setting which can be defined in a config file can also be defined using an environment variable.
+
+The prefix for all environment variables to be used in netbox-sync is: `NBS`
+
+For configuration in the `common` and `netbox` section a variable is defined like this
+```
+<PREFIX>_<SECTION_NAME>_<CONFIG_OPTION_KEY>=value
+```
+
+Following example represents the same configuration:
+```yaml
+# yaml config example
+common:
+  log_level: DEBUG2
+netbox:
+  host_fqdn: netbox-host.example.com
+  prune_enabled: true
+```
+```bash
+# this variable definition is equal to the yaml config sample above
+NBS_COMMON_LOG_LEVEL="DEBUG2"
+NBS_netbox_host_fqdn="netbox-host.example.com"
+NBS_NETBOX_PRUNE_ENABLED="true"
+```
+
+This way it is possible to expose for example the `NBS_NETBOX_API_KEY` only via an env variable.
+
+The config definitions for `sources` need to be defined using an index. Following conditions apply:
+* a single source needs to use the same index
+* the index can be number or a name (but contain any special characters to support env var parsing)
+* the source needs to be named with `_NAME` variable
+
+Example of defining a source with config and environment variables.
+```ini
+; example for a source
+[source/example-vcenter]
+enabled = True
+type = vmware
+host_fqdn = vcenter.example.com
+username = vcenter-readonly
+```
+```bash
+# define the password on command line
+# here we use '1' as index
+NBS_SOURCE_1_NAME="example-vcenter"
+NBS_SOURCE_1_PASSWORD="super-secret-and-not-saved-to-the-config-file"
+NBS_SOURCE_1_custom_dns_servers="10.0.23.23, 10.0.42.42"
+```
+
+Even to just define one source variable like `NBS_SOURCE_1_PASSWORD` the `NBS_SOURCE_1_NAME` needs to be defined as
+to associate to the according source definition.
+
+## Cron job
+In Order to sync all items regularly you can add a cron job like this one
+```
+ # NetBox Sync
+ 23 */2 * * *  /opt/netbox-sync/.venv/bin/python3 /opt/netbox-sync/netbox-sync.py >/dev/null 2>&1
+```
+
 ## Docker
 
 Run the application in a docker container. You can build it yourself or use the ones from docker hub.
@@ -105,71 +237,40 @@ docker run --rm -it -v $(pwd)/settings.ini:/app/settings.ini bbricardo/netbox-sy
 
 Run the containerized application in a kubernetes cluster
 
- * Build the container image
- * Tag and push the image to a container registry you have access to
- * Create a secret from the settings.ini
- * Update the image field in the manifest
- * Deploy the manifest to your k8s cluster and check the job is running
+* Create a config map with the default settings
+* Create a secret witch only contains the credentials needed
+* Adjust the provided [cronjob resource](https://github.com/bb-Ricardo/netbox-sync/blob/main/k8s-netbox-sync-cronjob.yaml) to your needs
+* Deploy the manifest to your k8s cluster and check the job is running
 
+config example saved as `settings.yaml`
+```yaml
+netbox:
+  host_fqdn: netbox.example.com
+
+source:
+  my-vcenter-example:
+    type: vmware
+    host_fqdn: vcenter.example.com
+    permitted_subnets: 172.16.0.0/12, 10.0.0.0/8, 192.168.0.0/16, fd00::/8
+    cluster_site_relation: Cluster_NYC = New York, Cluster_FFM.* = Frankfurt, Datacenter_TOKIO/.* = Tokio
+```
+
+secrets example saved as `secrets.yaml`
+```yaml
+netbox:
+  api_token: XYZXYZXYZXYZXYZXYZXYZXYZ
+source:
+  my-vcenter-example:
+    username: vcenter-readonly
+    password: super-secret
+```
+
+Create resource in your k8s cluster
  ```shell
- docker build -t netbox-vsphere-sync .
- docker image tag netbox-vsphere-sync your-registry.host/netbox-vsphere-sync:v1.2.0
- docker image push your-registry.host/netbox-vsphere-sync:v1.2.0
-
- kubectl create secret generic netbox-vsphere-sync --from-file=settings.ini
- kubectl apply -f netbox-vsphere-sync-cronjob.yaml
+kubectl create configmap netbox-sync-config --from-file=settings.yaml
+kubectl create secret generic netbox-sync-secrets --from-file=secrets.yaml
+kubectl apply -f k8s-netbox-sync-cronjob.yaml
  ```
-
-## NetBox API token
-In order to updated data in NetBox you need a NetBox API token.
-* API token with all permissions (read, write) except:
-  * auth
-  * secrets
-  * users
-
-A short description can be found [here](https://netbox.readthedocs.io/en/stable/rest-api/authentication/)
-
-# Running the script
-
-```
-usage: netbox-sync.py [-h] [-c settings.ini]
-                      [-l {DEBUG3,DEBUG2,DEBUG,INFO,WARNING,ERROR}] [-n] [-p]
-
-Sync objects from various sources to NetBox
-
-Version: 1.3.0 (2022-09-06)
-Project URL: https://github.com/bb-ricardo/netbox-sync
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -c settings.ini, --config settings.ini
-                        points to the config file to read config data from
-                        which is not installed under the default path
-                        './settings.ini'
-  -l {DEBUG3,DEBUG2,DEBUG,INFO,WARNING,ERROR}, --log_level {DEBUG3,DEBUG2,DEBUG,INFO,WARNING,ERROR}
-                        set log level (overrides config)
-  -n, --dry_run         Operate as usual but don't change anything in NetBox.
-                        Great if you want to test and see what would be
-                        changed.
-  -p, --purge           Remove (almost) all synced objects which were create
-                        by this script. This is helpful if you want to start
-                        fresh or stop using this script.
-```
-
-## TESTING
-It is recommended to set log level to `DEBUG2` this way the program should tell you what is happening and why.
-Also use the dry run option `-n` at the beginning to avoid changes directly in NetBox.
-
-## Setup
-Copy the [settings-example.ini](https://github.com/bb-Ricardo/netbox-sync/blob/main/settings-example.ini) sample settings file to `settings.ini`.
-All options are described in the example file.
-
-## Cron job
-In Order to sync all items regularly you can add a cron job like this one
-```
- # NetBox Sync
- 23 */2 * * *  /opt/netbox-sync/.venv/bin/python3 /opt/netbox-sync/netbox-sync.py >/dev/null 2>&1
-```
 
 # How it works
 **READ CAREFULLY**

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2022 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2023 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -7,12 +7,10 @@
 #  For a copy, see file LICENSE.txt included in this
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
-import atexit
 import datetime
 import pprint
-import re
 import ssl
-from ipaddress import ip_address, ip_network, ip_interface
+from ipaddress import ip_address, ip_interface
 from urllib.parse import unquote
 
 import urllib3
@@ -27,34 +25,14 @@ from pyVmomi import vim
 from pyVmomi.VmomiSupport import VmomiJSONEncoder
 
 from module.sources.common.source_base import SourceBase
+from module.sources.vmware.config import VMWareConfig
 from module.common.logging import get_logger, DEBUG3
-from module.common.misc import grab, dump, get_string_or_none, plural, quoted_split
-from module.common.support import normalize_mac_address, ip_valid_to_add_to_netbox
-from module.netbox.object_classes import (
-    NBTenantGroup,
-    NetBoxInterfaceType,
-    NBTag,
-    NBManufacturer,
-    NBDeviceType,
-    NBPlatform,
-    NBClusterType,
-    NBClusterGroup,
-    NBDeviceRole,
-    NBSite,
-    NBSiteGroup,
-    NBCluster,
-    NBDevice,
-    NBVM,
-    NBVMInterface,
-    NBInterface,
-    NBIPAddress,
-    NBPrefix,
-    NBTenant,
-    NBVRF,
-    NBVLAN,
-    NBVLANGroup,
-    NBCustomField
-)
+from module.common.misc import grab, dump, get_string_or_none, plural
+from module.common.support import normalize_mac_address
+from module.netbox.inventory import NetBoxInventory
+from module.netbox import *
+
+import re
 
 re_match_replace = re.compile('\$(\d)')
 
@@ -100,72 +78,6 @@ class VMWareHandler(SourceBase):
         NBCustomField
     ]
 
-    settings = {
-        "enabled": True,
-        "host_fqdn": None,
-        "port": 443,
-        "username": None,
-        "password": None,
-        "validate_tls_certs": False,
-        "proxy_host": None,
-        "proxy_port": None,
-        "cluster_exclude_filter": None,
-        "cluster_include_filter": None,
-        "host_exclude_filter": None,
-        "host_include_filter": None,
-        "vm_exclude_filter": None,
-        "vm_include_filter": None,
-        "permitted_subnets": None,
-        "collect_hardware_asset_tag": True,
-        "match_host_by_serial": True,
-        "cluster_site_relation": None,
-        "cluster_tag_relation": None,
-        "cluster_tenant_relation": None,
-        "cluster_tag_source": None,
-        "host_role_relation": None,
-        "host_site_relation": None,
-        "host_tag_relation": None,
-        "host_tenant_relation": None,
-        "host_tag_source": None,
-        "vm_platform_relation": None,
-        "vm_role_relation": None,
-        "vm_tag_relation": None,
-        "vm_tenant_relation": None,
-        "vm_tag_source": None,
-        "dns_name_lookup": False,
-        "custom_dns_servers": None,
-        "set_primary_ip": "when-undefined",
-        "skip_vm_comments": False,
-        "skip_vm_templates": True,
-        "skip_offline_vms": False,
-        "skip_srm_placeholder_vms": False,
-        "strip_host_domain_name": False,
-        "strip_vm_domain_name": False,
-        "sync_custom_attributes": False,
-        "host_custom_object_attributes": None,
-        "vm_custom_object_attributes": None,
-        "set_source_name_as_cluster_group": False,
-        "sync_vm_dummy_interfaces": False,
-        "disable_vlan_sync": False,
-        "host_management_interface_match": "management, mgmt",
-        "ip_tenant_inheritance_order": "device, prefix",
-        "site_group": None,
-        "group_vlans": None,
-    }
-
-    deprecated_settings = {}
-
-    removed_settings = {
-        "netbox_host_device_role": "host_role_relation",
-        "netbox_vm_device_role": "vm_role_relation",
-        "sync_tags": "host_tag_source', 'vm_tag_source' or 'cluster_tag_source",
-        "sync_parent_tags": "host_tag_source', 'vm_tag_source' or 'cluster_tag_source"
-    }
-
-    init_successful = False
-    inventory = None
-    name = None
-    source_tag = None
     source_type = "vmware"
 
     recursion_level = 0
@@ -180,23 +92,26 @@ class VMWareHandler(SourceBase):
     group_vlans = None
     nb_site_group= None
 
-    def __init__(self, name=None, settings=None, inventory=None):
-
+    def __init__(self, name=None):
         if name is None:
             raise ValueError(f"Invalid value for attribute 'name': '{name}'.")
 
-        self.inventory = inventory
+        self.inventory = NetBoxInventory()
         self.name = name
 
-        self.parse_config_settings(settings)
+        # parse settings
+        settings_handler = VMWareConfig()
+        settings_handler.source_name = self.name
+        self.settings = settings_handler.parse()
 
-        self.source_tag = f"Source: {name}"
+        self.set_source_tag()
         self.site_name = f"vCenter: {name}"
 
-        if self.enabled is False:
+        if self.settings.enabled is False:
             log.info(f"Source '{name}' is currently disabled. Skipping")
             return
 
+        self._sdk_instance = None
         self.create_sdk_session()
 
         if self.session is None:
@@ -220,165 +135,8 @@ class VMWareHandler(SourceBase):
         self.processed_vm_uuid = list()
         self.object_cache = dict()
         self.parsing_vms_the_first_time = True
-
-    def parse_config_settings(self, config_settings):
-        """
-        Validate parsed settings from config file
-
-        Parameters
-        ----------
-        config_settings: dict
-            dict of config settings
-
-        """
-
-        validation_failed = False
-
-        for setting in ["host_fqdn", "port", "username", "password"]:
-            if config_settings.get(setting) is None:
-                log.error(f"Config option '{setting}' in 'source/{self.name}' can't be empty/undefined")
-                validation_failed = True
-
-        # check permitted ip subnets
-        if config_settings.get("permitted_subnets") is None:
-            log.info(f"Config option 'permitted_subnets' in 'source/{self.name}' is undefined. "
-                     f"No IP addresses will be populated to NetBox!")
-        else:
-            config_settings["permitted_subnets"] = \
-                [x.strip() for x in config_settings.get("permitted_subnets").split(",") if x.strip() != ""]
-
-            permitted_subnets = list()
-            excluded_subnets = list()
-            # add "invisible" config option
-            self.settings["excluded_subnets"] = None
-
-            for subnet in config_settings["permitted_subnets"]:
-                excluded = False
-                if subnet[0] == "!":
-                    excluded = True
-                    subnet = subnet[1:].strip()
-
-                try:
-                    if excluded is True:
-                        excluded_subnets.append(ip_network(subnet))
-                    else:
-                        permitted_subnets.append(ip_network(subnet))
-                except Exception as e:
-                    log.error(f"Problem parsing permitted subnet: {e}")
-                    validation_failed = True
-
-            config_settings["permitted_subnets"] = permitted_subnets
-            config_settings["excluded_subnets"] = excluded_subnets
-
-        # check include and exclude filter expressions
-        for setting in [x for x in config_settings.keys() if "filter" in x]:
-            if config_settings.get(setting) is None or config_settings.get(setting).strip() == "":
-                continue
-
-            re_compiled = None
-            try:
-                re_compiled = re.compile(config_settings.get(setting))
-            except Exception as e:
-                log.error(f"Problem parsing regular expression for '{setting}': {e}")
-                validation_failed = True
-
-            config_settings[setting] = re_compiled
-
-        for relation_option in [x for x in self.settings.keys() if "relation" in x]:
-
-            if config_settings.get(relation_option) is None:
-                continue
-
-            relation_data = list()
-
-            relation_type = relation_option.split("_")[1]
-
-            for relation in quoted_split(config_settings.get(relation_option)):
-
-                object_name = relation.split("=")[0].strip(' "')
-                relation_name = relation.split("=")[1].strip(' "')
-
-                if len(object_name) == 0 or len(relation_name) == 0:
-                    log.error(f"Config option '{relation}' malformed got '{object_name}' for "
-                              f"object name and '{relation_name}' for {relation_type} name.")
-                    validation_failed = True
-
-                try:
-                    re_compiled = re.compile(object_name)
-                except Exception as e:
-                    log.error(f"Problem parsing regular expression '{object_name}' for '{relation}': {e}")
-                    validation_failed = True
-                    continue
-
-                relation_data.append({
-                    "object_regex": re_compiled,
-                    f"assigned_name": relation_name
-                })
-
-            config_settings[relation_option] = relation_data
-
-        for custom_object_option in [x for x in self.settings.keys() if "custom_object_attributes" in x]:
-
-            if config_settings.get(custom_object_option) is None:
-                continue
-
-            config_settings[custom_object_option] = quoted_split(config_settings.get(custom_object_option))
-
-        for tag_source in [x for x in self.settings.keys() if "tag_source" in x]:
-
-            config_settings[tag_source] = quoted_split(config_settings.get(tag_source))
-
-            valid_tag_sources = [
-                "object", "parent_folder_1", "parent_folder_2", "cluster", "datacenter"
-            ]
-            for tag_source_option in config_settings[tag_source]:
-                if tag_source_option not in valid_tag_sources:
-                    log.error(f"Tag source '{tag_source_option}' for '{tag_source}' option invalid.")
-                    validation_failed = True
-                    continue
-
-        if config_settings.get("dns_name_lookup") is True and config_settings.get("custom_dns_servers") is not None:
-
-            custom_dns_servers = \
-                [x.strip() for x in config_settings.get("custom_dns_servers").split(",") if x.strip() != ""]
-
-            tested_custom_dns_servers = list()
-            for custom_dns_server in custom_dns_servers:
-                try:
-                    tested_custom_dns_servers.append(str(ip_address(custom_dns_server)))
-                except ValueError:
-                    log.error(f"Config option 'custom_dns_servers' value '{custom_dns_server}' "
-                              f"does not appear to be an IP address.")
-                    validation_failed = True
-
-            config_settings["custom_dns_servers"] = tested_custom_dns_servers
-
-        if len(config_settings.get("host_management_interface_match") or "") > 0:
-            host_management_interface_match = config_settings.get("host_management_interface_match")
-        else:
-            host_management_interface_match = self.settings.get("host_management_interface_match")
-
-        config_settings["host_management_interface_match"] = \
-            [x.strip() for x in host_management_interface_match.split(",")]
-
-        config_settings["ip_tenant_inheritance_order"] = \
-            [x.strip() for x in grab(config_settings, "ip_tenant_inheritance_order", fallback="").split(",")]
-
-        for ip_tenant_inheritance in config_settings["ip_tenant_inheritance_order"]:
-            if ip_tenant_inheritance not in ["device", "prefix", "disabled"]:
-                log.error(f"Config value '{ip_tenant_inheritance}' invalid for "
-                          f"config option 'ip_tenant_inheritance_order'!")
-                validation_failed = True
-        if len(config_settings["ip_tenant_inheritance_order"]) > 2:
-            log.error("Config option 'ip_tenant_inheritance_order' can contain only 2 items max")
-            validation_failed = True
-
-        if validation_failed is True:
-            log.error("Config validation failed. Exit!")
-            exit(1)
-
-        for setting in self.settings.keys():
-            setattr(self, setting, config_settings.get(setting))
+        self.objects_to_reevaluate = list()
+        self.parsing_objects_to_reevaluate = False
 
     def create_sdk_session(self):
         """
@@ -392,59 +150,59 @@ class VMWareHandler(SourceBase):
         if self.session is not None:
             return True
 
-        log.debug(f"Starting vCenter SDK connection to '{self.host_fqdn}'")
+        log.debug(f"Starting vCenter SDK connection to '{self.settings.host_fqdn}'")
 
         ssl_context = ssl.create_default_context()
-        if bool(self.validate_tls_certs) is False:
+        if self.settings.validate_tls_certs is False:
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
 
         connection_params = dict(
-            host=self.host_fqdn,
-            port=self.port,
+            host=self.settings.host_fqdn,
+            port=self.settings.port,
             sslContext=ssl_context
         )
 
         # uses connect.SmartStubAdapter
-        if self.proxy_host is not None and self.proxy_port is not None:
+        if self.settings.proxy_host is not None and self.settings.proxy_port is not None:
             connection_params.update(
-                httpProxyHost=self.proxy_host,
-                httpProxyPort=int(self.proxy_port),
+                httpProxyHost=self.settings.proxy_host,
+                httpProxyPort=self.settings.proxy_port,
             )
 
         # uses connect.SmartConnect
         else:
             connection_params.update(
-                user=self.username,
-                pwd=self.password,
+                user=self.settings.username,
+                pwd=self.settings.password,
             )
 
-        def_exception_text = f"Unable to connect to vCenter instance '{self.host_fqdn}' on port {self.port}."
+        def_exception_text = f"Unable to connect to vCenter instance " \
+                             f"'{self.settings.host_fqdn}' on port {self.settings.port}."
 
         try:
-            if self.proxy_host is not None and self.proxy_port is not None:
+            if self.settings.proxy_host is not None and self.settings.proxy_port is not None:
                 smart_stub = connect.SmartStubAdapter(**connection_params)
-                instance = vim.ServiceInstance('ServiceInstance', smart_stub)
-                content = instance.RetrieveContent()
-                content.sessionManager.Login(self.username, self.password, None)
+                self._sdk_instance = vim.ServiceInstance('ServiceInstance', smart_stub)
+                content = self._sdk_instance.RetrieveContent()
+                content.sessionManager.Login(self.settings.username, self.settings.password, None)
             else:
 
-                instance = connect.SmartConnect(**connection_params)
+                self._sdk_instance = connect.SmartConnect(**connection_params)
 
-            atexit.register(connect.Disconnect, instance)
-            self.session = instance.RetrieveContent()
+            self.session = self._sdk_instance.RetrieveContent()
 
         except vim.fault.InvalidLogin as e:
             log.error(f"{def_exception_text} {e.msg}")
             return False
         except vim.fault.NoPermission as e:
-            log.error(f"{def_exception_text} User {self.username} does not have required permission. {e.msg}")
+            log.error(f"{def_exception_text} User {self.settings.username} does not have required permission. {e.msg}")
             return False
         except Exception as e:
             log.error(f"{def_exception_text} Reason: {e}")
             return False
 
-        log.info(f"Successfully connected to vCenter SDK '{self.host_fqdn}'")
+        log.info(f"Successfully connected to vCenter SDK '{self.settings.host_fqdn}'")
 
         return True
 
@@ -460,53 +218,69 @@ class VMWareHandler(SourceBase):
         if self.tag_session is not None:
             return True
 
-        if len(self.cluster_tag_source) + len(self.host_tag_source) + len(self.vm_tag_source) == 0:
+        source_tag_settings_list = [
+            self.settings.cluster_tag_source,
+            self.settings.host_tag_source,
+            self.settings.vm_tag_source
+        ]
+
+        # check if vm tag syncing is configured
+        if source_tag_settings_list.count(None) == len(source_tag_settings_list):
             return False
 
-        log.debug(f"Starting vCenter API connection to '{self.host_fqdn}'")
+        if vsphere_automation_sdk_available is False:
+            log.warning(f"Unable to import Python 'vsphere-automation-sdk'. Tag syncing will be disabled.")
+            return False
 
-        if len(self.cluster_tag_source) > 0 or len(self.host_tag_source) > 0 or len(self.vm_tag_source) > 0:
-
-            if vsphere_automation_sdk_available is False:
-                self.__setattr__("cluster_tag_source", list())
-                self.__setattr__("host_tag_source", list())
-                self.__setattr__("vm_tag_source", list())
-                log.warning(f"Unable to import Python 'vsphere-automation-sdk'. Tag syncing will be disabled.")
-                return False
+        log.debug(f"Starting vCenter API connection to '{self.settings.host_fqdn}'")
 
         # create a requests session to enable/disable TLS verification
         session = requests.session()
-        session.verify = bool(self.validate_tls_certs)
+        session.verify = self.settings.validate_tls_certs
 
         # disable TLS insecure warnings if user explicitly switched off validation
-        if bool(self.validate_tls_certs) is False:
+        if self.settings.validate_tls_certs is False:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         # adds proxy to the session
-        if self.proxy_host is not None and self.proxy_port is not None:
+        if self.settings.proxy_host is not None and self.settings.proxy_port is not None:
             session.proxies.update({
-                "http": f"http://{self.proxy_host}:{self.proxy_port}",
-                "https": f"http://{self.proxy_host}:{self.proxy_port}",
+                "http": f"http://{self.settings.proxy_host}:{self.settings.proxy_port}",
+                "https": f"http://{self.settings.proxy_host}:{self.settings.proxy_port}",
             })
 
         try:
             self.tag_session = create_vsphere_client(
-                server=f"{self.host_fqdn}:{self.port}",
-                username=self.username,
-                password=self.password,
+                server=f"{self.settings.host_fqdn}:{self.settings.port}",
+                username=self.settings.username,
+                password=self.settings.password,
                 session=session)
 
         except Exception as e:
-            self.__setattr__("cluster_tag_source", list())
-            self.__setattr__("host_tag_source", list())
-            self.__setattr__("vm_tag_source", list())
-            log.warning(f"Unable to connect to vCenter API instance '{self.host_fqdn}' on port {self.port}: {e}")
+            log.warning(f"Unable to connect to vCenter API instance "
+                        f"'{self.settings.host_fqdn}' on port {self.settings.port}: {e}")
             log.warning("Tag syncing will be disabled.")
             return False
 
-        log.info(f"Successfully connected to vCenter API '{self.host_fqdn}'")
+        log.info(f"Successfully connected to vCenter API '{self.settings.host_fqdn}'")
 
         return True
+
+    def finish(self):
+
+        # closing tag session
+        if self._sdk_instance is not None:
+            try:
+                connect.Disconnect(self._sdk_instance)
+            except Exception as e:
+                log.error(f"unable to close vCenter SDK connection: {e}")
+
+        # closing SDK session
+        if self.tag_session is not None:
+            try:
+                del self.tag_session
+            except Exception as e:
+                log.error(f"unable to close vCenter API instance connection: {e}")
 
     def apply(self):
         """
@@ -516,7 +290,7 @@ class VMWareHandler(SourceBase):
         Every update of new/existing objects fot this source has to happen here.
         """
 
-        log.info(f"Query data from vCenter: '{self.host_fqdn}'")
+        log.info(f"Query data from vCenter: '{self.settings.host_fqdn}'")
 
         """
         Mapping of object type keywords to view types and handlers
@@ -583,7 +357,7 @@ class VMWareHandler(SourceBase):
         }
 
         # skip virtual machines which are reported offline
-        if self.skip_offline_vms is True:
+        if self.settings.skip_offline_vms is True:
             log.info("Skipping offline VMs")
             del object_mapping["offline virtual machine"]
 
@@ -639,6 +413,18 @@ class VMWareHandler(SourceBase):
                 view_details.get("view_handler")(obj)
 
             container_view.Destroy()
+
+        self.parsing_objects_to_reevaluate = True
+        log.info("Parsing objects which were marked to be reevaluated")
+
+        for obj in self.objects_to_reevaluate:
+
+            if isinstance(obj, vim.HostSystem):
+                self.add_host(obj)
+            elif isinstance(obj, vim.VirtualMachine):
+                self.add_virtual_machine(obj)
+            else:
+                log.error(f"Unable to handle reevaluation of {obj} (type: {type(obj)})")
 
         self.update_basic_data()
 
@@ -890,30 +676,30 @@ class VMWareHandler(SourceBase):
             return
 
         tag_list = list()
-        if vsphere_automation_sdk_available is True:
-            if len(self.cluster_tag_source) + len(self.host_tag_source) + len(self.vm_tag_source) > 0:
+        if self.tag_session is not None:
+
+            # noinspection PyBroadException
+            try:
+                object_tag_ids = self.tag_session.tagging.TagAssociation.list_attached_tags(
+                    DynamicID(type=grab(obj, "_wsdlName"), id=grab(obj, "_moId")))
+            except Exception as e:
+                log.error(f"Unable to retrieve vCenter tags for '{obj.name}': {e}")
+                return
+
+            for tag_id in object_tag_ids:
+
                 # noinspection PyBroadException
                 try:
-                    object_tag_ids = self.tag_session.tagging.TagAssociation.list_attached_tags(
-                        DynamicID(type=grab(obj, "_wsdlName"), id=grab(obj, "_moId")))
+                    tag_name = self.tag_session.tagging.Tag.get(tag_id).name
+                    tag_description = self.tag_session.tagging.Tag.get(tag_id).description
                 except Exception as e:
-                    log.error(f"Unable to retrieve vCenter tags for '{obj.name}': {e}")
-                    object_tag_ids = list()
+                    log.error(f"Unable to retrieve vCenter tag '{tag_id}' for '{obj.name}': {e}")
+                    continue
 
-                for tag_id in object_tag_ids:
-
-                    # noinspection PyBroadException
-                    try:
-                        tag_name = self.tag_session.tagging.Tag.get(tag_id).name
-                        tag_description = self.tag_session.tagging.Tag.get(tag_id).description
-                    except Exception as e:
-                        log.error(f"Unable to retrieve vCenter tag '{tag_id}' for '{obj.name}': {e}")
-                        continue
-
-                    tag_list.append(self.inventory.add_update_object(NBTag, data={
-                        "name": tag_name,
-                        "description": tag_description
-                    }))
+                tag_list.append(self.inventory.add_update_object(NBTag, data={
+                    "name": tag_name,
+                    "description": tag_description
+                }))
 
         return tag_list
 
@@ -938,15 +724,15 @@ class VMWareHandler(SourceBase):
         tag_list = list()
 
         if isinstance(obj, (vim.ClusterComputeResource, vim.ComputeResource)):
-            tag_source = self.cluster_tag_source
+            tag_source = self.settings.cluster_tag_source
         elif isinstance(obj, vim.HostSystem):
-            tag_source = self.host_tag_source
+            tag_source = self.settings.host_tag_source
         elif isinstance(obj, vim.VirtualMachine):
-            tag_source = self.vm_tag_source
+            tag_source = self.settings.vm_tag_source
         else:
             raise ValueError(f"Tags for '{grab(obj, '_wsdlName')}' are not supported")
 
-        if len(tag_source) == 0 or vsphere_automation_sdk_available is False:
+        if tag_source is None or self.tag_session is None:
             return tag_list
 
         log.debug2(f"Collecting tags for {obj.name}")
@@ -994,16 +780,16 @@ class VMWareHandler(SourceBase):
         return_custom_fields = dict()
 
         custom_value = list()
-        if self.sync_custom_attributes is True:
+        if self.settings.sync_custom_attributes is True:
             custom_value = grab(obj, "customValue", fallback=list())
 
         if grab(obj, "_wsdlName") == "VirtualMachine":
             content_type = "virtualization.virtualmachine"
-            custom_object_attributes = self.vm_custom_object_attributes or list()
+            custom_object_attributes = self.settings.vm_custom_object_attributes or list()
             object_attribute_prefix = "vm"
         else:
             content_type = "dcim.device"
-            custom_object_attributes = self.host_custom_object_attributes or list()
+            custom_object_attributes = self.settings.host_custom_object_attributes or list()
             object_attribute_prefix = "host"
 
         # add basic host data to device
@@ -1123,7 +909,7 @@ class VMWareHandler(SourceBase):
         """
 
         resolved_list = list()
-        for single_relation in grab(self, relation, fallback=list()):
+        for single_relation in grab(self.settings, relation, fallback=list()):
             object_regex = single_relation.get("object_regex")
             match_found = False
             m = object_regex.match(name)
@@ -1159,7 +945,7 @@ class VMWareHandler(SourceBase):
             return resolved_name
 
     def add_device_vm_to_inventory(self, object_type, object_data, pnic_data=None, vnic_data=None,
-                                   nic_ips=None, p_ipv4=None, p_ipv6=None):
+                                   nic_ips=None, p_ipv4=None, p_ipv6=None, vmware_object=None):
         """
         Add/update device/VM object in inventory based on gathered data.
 
@@ -1218,6 +1004,8 @@ class VMWareHandler(SourceBase):
             primary IPv4 as string including netmask/prefix
         p_ipv6: str
             primary IPv6 as string including netmask/prefix
+        vmware_object: (vim.HostSystem, vim.VirtualMachine)
+            vmware object to pass on to 'add_update_interface' method to setup reevaluation
 
         """
 
@@ -1260,7 +1048,7 @@ class VMWareHandler(SourceBase):
         if object_type == NBDevice:
 
             if device_vm_object is None and object_data.get("serial") is not None and \
-                    bool(self.match_host_by_serial) is True:
+                    self.settings.match_host_by_serial is True:
                 log.debug2(f"No match found. Trying to find {object_type.name} based on serial number")
 
                 device_vm_object = self.inventory.get_by_data(object_type, data={"serial": object_data.get("serial")})
@@ -1289,15 +1077,19 @@ class VMWareHandler(SourceBase):
         else:
             device_vm_object.update(data=object_data, source=self)
 
+        # add object to cache
+        self.add_object_to_cache(vmware_object, device_vm_object)
+
         # update role according to config settings
         object_name = object_data.get(object_type.primary_key)
         role_name = self.get_object_relation(object_name,
-                                             "host_role_relation" if object_type == NBDevice else "vm_role_relation",
-                                             fallback="Server")
+                                             "host_role_relation" if object_type == NBDevice else "vm_role_relation")
 
         if object_type == NBDevice:
+            if role_name is None:
+                role_name = "Server"
             device_vm_object.update(data={"device_role": {"name": role_name}})
-        if object_type == NBVM:
+        if object_type == NBVM and role_name is not None:
             device_vm_object.update(data={"role": {"name": role_name}})
 
         # compile all nic data into one dictionary
@@ -1329,20 +1121,24 @@ class VMWareHandler(SourceBase):
 
         for int_name, int_data in nic_data.items():
 
+            if nic_object_dict.get(int_name) is not None:
+                if object_type == NBDevice and self.settings.overwrite_device_interface_name is False:
+                    del int_data["name"]
+                if object_type == NBVM and self.settings.overwrite_vm_interface_name is False:
+                    del int_data["name"]
+
             # add/update interface with retrieved data
             nic_object, ip_address_objects = self.add_update_interface(nic_object_dict.get(int_name), device_vm_object,
                                                                        int_data, nic_ips.get(int_name, list()),
-                                                                       disable_vlan_sync=self.disable_vlan_sync,
-                                                                       ip_tenant_inheritance_order=
-                                                                       self.ip_tenant_inheritance_order)
+                                                                       vmware_object=vmware_object)
 
             # add all interface IPs
             for ip_object in ip_address_objects:
 
-                ip_interface_object = ip_interface(grab(ip_object, "data.address"))
-
                 if ip_object is None:
                     continue
+
+                ip_interface_object = ip_interface(grab(ip_object, "data.address"))
 
                 # continue if address is not a primary IP
                 if ip_interface_object not in [primary_ipv4_object, primary_ipv6_object]:
@@ -1351,7 +1147,7 @@ class VMWareHandler(SourceBase):
                 # set/update/remove primary IP addresses
                 set_this_primary_ip = False
                 ip_version = ip_interface_object.ip.version
-                if self.set_primary_ip == "always":
+                if self.settings.set_primary_ip == "always":
 
                     for object_type in [NBDevice, NBVM]:
 
@@ -1374,7 +1170,8 @@ class VMWareHandler(SourceBase):
 
                     set_this_primary_ip = True
 
-                elif self.set_primary_ip != "never" and grab(device_vm_object, f"data.primary_ip{ip_version}") is None:
+                elif self.settings.set_primary_ip != "never" and \
+                        grab(device_vm_object, f"data.primary_ip{ip_version}") is None:
                     set_this_primary_ip = True
 
                 if set_this_primary_ip is True:
@@ -1460,7 +1257,7 @@ class VMWareHandler(SourceBase):
             datacenter object
 
         """
-        if self.set_source_name_as_cluster_group is True:
+        if self.settings.set_source_name_as_cluster_group is True:
             name = self.name
         else:
             name = get_string_or_none(grab(obj, "name"))
@@ -1472,7 +1269,7 @@ class VMWareHandler(SourceBase):
 
         object_data = {"name": name}
 
-        if self.set_source_name_as_cluster_group is True:
+        if self.settings.set_source_name_as_cluster_group is True:
             label = "Datacenter Name"
             custom_field = self.add_update_custom_field({
                 "name": f"vcsa_{label}",
@@ -1486,8 +1283,7 @@ class VMWareHandler(SourceBase):
                 grab(custom_field, "data.name"): get_string_or_none(grab(obj, "name"))
             }
 
-        self.add_object_to_cache(obj,
-                                 self.inventory.add_update_object(NBClusterGroup, data=object_data, source=self))
+        self.add_object_to_cache(obj, self.inventory.add_update_object(NBClusterGroup, data=object_data, source=self))
 
     def add_cluster(self, obj):
         """
@@ -1501,7 +1297,7 @@ class VMWareHandler(SourceBase):
         """
 
         name = get_string_or_none(grab(obj, "name"))
-        if self.set_source_name_as_cluster_group is True:
+        if self.settings.set_source_name_as_cluster_group is True:
             group = self.inventory.get_by_data(NBClusterGroup, data={"name": self.name})
         else:
             group = self.get_object_from_cache(self.get_parent_object_by_class(obj, vim.Datacenter))
@@ -1511,7 +1307,7 @@ class VMWareHandler(SourceBase):
 
         # if we're parsing a single host "cluster" and the hosts domain name should be stripped,
         # then the ComputeResources domain name gets stripped as well
-        if isinstance(obj, vim.ComputeResource) and self.strip_host_domain_name is True:
+        if isinstance(obj, vim.ComputeResource) and self.settings.strip_host_domain_name is True:
             name = name.split(".")[0]
 
         group_name = grab(group, "data.name")
@@ -1520,8 +1316,12 @@ class VMWareHandler(SourceBase):
         log.debug(f"Parsing vCenter cluster: {full_cluster_name}")
 
         # check for full name and then for cluster name only
-        if self.passes_filter(full_cluster_name, self.cluster_include_filter, self.cluster_exclude_filter) is False \
-                or self.passes_filter(name, self.cluster_include_filter, self.cluster_exclude_filter) is False:
+        if self.passes_filter(full_cluster_name,
+                              self.settings.cluster_include_filter,
+                              self.settings.cluster_exclude_filter) is False \
+                or self.passes_filter(name,
+                                      self.settings.cluster_include_filter,
+                                      self.settings.cluster_exclude_filter) is False:
             return
 
         site_name = self.get_site_name(NBCluster, full_cluster_name)
@@ -1695,7 +1495,7 @@ class VMWareHandler(SourceBase):
 
         name = get_string_or_none(grab(obj, "name"))
 
-        if name is not None and self.strip_host_domain_name is True:
+        if name is not None and self.settings.strip_host_domain_name is True:
             name = name.split(".")[0]
 
         # parse data
@@ -1732,14 +1532,14 @@ class VMWareHandler(SourceBase):
         cluster_name = get_string_or_none(grab(nb_cluster_object, "data.name"))
 
         # get a site for this host
-        if self.set_source_name_as_cluster_group is True:
+        if self.settings.set_source_name_as_cluster_group is True:
             group = self.inventory.get_by_data(NBClusterGroup, data={"name": self.name})
         else:
             group = self.get_object_from_cache(self.get_parent_object_by_class(obj, vim.Datacenter))
         group_name = grab(group, "data.name")
         site_name = self.get_site_name(NBDevice, name, f"{group_name}/{cluster_name}")
 
-        if name in self.processed_host_names.get(site_name, list()):
+        if name in self.processed_host_names.get(site_name, list()) and obj not in self.objects_to_reevaluate:
             log.warning(f"Host '{name}' for site '{site_name}' already parsed. "
                         "Make sure to use unique host names. Skipping")
             return
@@ -1751,7 +1551,7 @@ class VMWareHandler(SourceBase):
         self.processed_host_names[site_name].append(name)
 
         # filter hosts by name
-        if self.passes_filter(name, self.host_include_filter, self.host_exclude_filter) is False:
+        if self.passes_filter(name, self.settings.host_include_filter, self.settings.host_exclude_filter) is False:
             return
 
         #
@@ -1797,7 +1597,7 @@ class VMWareHandler(SourceBase):
         # add asset tag if desired and present
         asset_tag = None
 
-        if bool(self.collect_hardware_asset_tag) is True and "AssetTag" in identifier_dict.keys():
+        if self.settings.collect_hardware_asset_tag is True and "AssetTag" in identifier_dict.keys():
 
             banned_tags = ["Default string", "NA", "N/A", "None", "Null", "oem", "o.e.m",
                            "to be filled by o.e.m.", "Unknown"]
@@ -2124,7 +1924,7 @@ class VMWareHandler(SourceBase):
 
             # check if interface has the default route or is described as management interface
             vnic_is_primary = False
-            for management_match in self.host_management_interface_match:
+            for management_match in self.settings.host_management_interface_match:
                 if management_match in vnic_description.lower():
                     vnic_is_primary = True
 
@@ -2137,7 +1937,7 @@ class VMWareHandler(SourceBase):
 
             int_v4 = "{}/{}".format(grab(vnic, "spec.ip.ipAddress"), grab(vnic, "spec.ip.subnetMask"))
 
-            if ip_valid_to_add_to_netbox(int_v4, self.permitted_subnets, self.excluded_subnets, vnic_name) is True:
+            if self.settings.permitted_subnets.permitted(int_v4, interface_name=vnic_name) is True:
                 vnic_ips[vnic_name].append(int_v4)
 
                 if vnic_is_primary is True and host_primary_ip4 is None:
@@ -2147,7 +1947,7 @@ class VMWareHandler(SourceBase):
 
                 int_v6 = "{}/{}".format(grab(ipv6_entry, "ipAddress"), grab(ipv6_entry, "prefixLength"))
 
-                if ip_valid_to_add_to_netbox(int_v6, self.permitted_subnets, self.excluded_subnets, vnic_name) is True:
+                if self.settings.permitted_subnets.permitted(int_v6, interface_name=vnic_name) is True:
                     vnic_ips[vnic_name].append(int_v6)
 
                     # set first valid IPv6 address as primary IPv6
@@ -2159,7 +1959,7 @@ class VMWareHandler(SourceBase):
         # add host to inventory
         self.add_device_vm_to_inventory(NBDevice, object_data=host_data, pnic_data=pnic_data_dict,
                                         vnic_data=vnic_data_dict, nic_ips=vnic_ips,
-                                        p_ipv4=host_primary_ip4, p_ipv6=host_primary_ip6)
+                                        p_ipv4=host_primary_ip4, p_ipv6=host_primary_ip6, vmware_object=obj)
 
         return
 
@@ -2192,7 +1992,7 @@ class VMWareHandler(SourceBase):
 
         name = get_string_or_none(grab(obj, "name"))
 
-        if name is not None and self.strip_vm_domain_name is True:
+        if name is not None and self.settings.strip_vm_domain_name is True:
             name = name.split(".")[0]
 
         #
@@ -2200,9 +2000,9 @@ class VMWareHandler(SourceBase):
         #
 
         # get VM UUID
-        vm_uuid = grab(obj, "config.uuid")
+        vm_uuid = grab(obj, "config.instanceUuid")
 
-        if vm_uuid is None or vm_uuid in self.processed_vm_uuid:
+        if vm_uuid is None or vm_uuid in self.processed_vm_uuid and obj not in self.objects_to_reevaluate:
             return
 
         log.debug(f"Parsing vCenter VM: {name}")
@@ -2212,11 +2012,11 @@ class VMWareHandler(SourceBase):
 
         # check if vm is template
         template = grab(obj, "config.template")
-        if bool(self.skip_vm_templates) is True and template is True:
+        if bool(self.settings.skip_vm_templates) is True and template is True:
             log.debug2(f"VM '{name}' is a template. Skipping")
             return
 
-        if bool(self.skip_srm_placeholder_vms) is True \
+        if bool(self.settings.skip_srm_placeholder_vms) is True \
                 and f"{grab(obj, 'config.managedBy.extensionKey')}".startswith("com.vmware.vcDr"):
             log.debug2(f"VM '{name}' is a SRM placeholder VM. Skipping")
             return
@@ -2236,7 +2036,7 @@ class VMWareHandler(SourceBase):
         if cluster_object is None:
             cluster_object = self.get_parent_object_by_class(parent_host, vim.ComputeResource)
 
-        if self.set_source_name_as_cluster_group is True:
+        if self.settings.set_source_name_as_cluster_group is True:
             group = self.inventory.get_by_data(NBClusterGroup, data={"name": self.name})
         else:
             group = self.get_parent_object_by_class(cluster_object, vim.Datacenter)
@@ -2256,7 +2056,7 @@ class VMWareHandler(SourceBase):
         cluster_name = grab(nb_cluster_object, "data.name")
         cluster_full_name = f"{group.name}/{cluster_name}"
 
-        if name in self.processed_vm_names.get(cluster_full_name, list()):
+        if name in self.processed_vm_names.get(cluster_full_name, list()) and obj not in self.objects_to_reevaluate:
             log.warning(f"Virtual machine '{name}' for cluster '{cluster_full_name}' already parsed. "
                         "Make sure to use unique VM names. Skipping")
             return
@@ -2268,7 +2068,7 @@ class VMWareHandler(SourceBase):
         self.processed_vm_names[cluster_full_name].append(name)
 
         # filter VMs by name
-        if self.passes_filter(name, self.vm_include_filter, self.vm_exclude_filter) is False:
+        if self.passes_filter(name, self.settings.vm_include_filter, self.settings.vm_exclude_filter) is False:
             return
 
         #
@@ -2294,7 +2094,7 @@ class VMWareHandler(SourceBase):
                         ]) / 1024 / 1024)
 
         annotation = None
-        if bool(self.skip_vm_comments) is False:
+        if self.settings.skip_vm_comments is False:
             annotation = get_string_or_none(grab(obj, "config.annotation"))
 
         # assign vm_tenant_relation
@@ -2319,6 +2119,9 @@ class VMWareHandler(SourceBase):
         # issue: https://github.com/netbox-community/netbox/issues/10131#issuecomment-1225783758
         if version.parse(self.inventory.netbox_api_version) >= version.parse("3.3.0"):
             vm_data["site"] = {"name": site_name}
+
+            if self.settings.track_vm_host:
+                vm_data["device"] = self.get_object_from_cache(parent_host)
 
         if platform is not None:
             vm_data["platform"] = {"name": platform}
@@ -2479,8 +2282,7 @@ class VMWareHandler(SourceBase):
 
                     int_ip_address = f"{int_ip.ipAddress}/{int_ip.prefixLength}"
 
-                    if ip_valid_to_add_to_netbox(int_ip_address, self.permitted_subnets,
-                                                 self.excluded_subnets, int_full_name) is False:
+                    if self.settings.permitted_subnets.permitted(int_ip_address, interface_name=int_full_name) is False:
                         continue
 
                     nic_ips[int_full_name].append(int_ip_address)
@@ -2507,7 +2309,7 @@ class VMWareHandler(SourceBase):
                 "enabled": int_connected,
             }
 
-            if int_mtu is not None:
+            if int_mtu is not None and self.settings.sync_vm_interface_mtu is True:
                 vm_nic_data["mtu"] = int_mtu
             if int_mode is not None:
                 vm_nic_data["mode"] = int_mode
@@ -2541,7 +2343,7 @@ class VMWareHandler(SourceBase):
             nic_data[int_full_name] = vm_nic_data
 
         # find dummy guest NIC interfaces
-        if self.sync_vm_dummy_interfaces is True:
+        if self.settings.sync_vm_dummy_interfaces is True:
             for guest_nic in grab(obj, "guest.net", fallback=list()):
 
                 # get matching guest NIC MAC
@@ -2565,11 +2367,8 @@ class VMWareHandler(SourceBase):
 
                     int_ip_address = f"{int_ip.ipAddress}/{int_ip.prefixLength}"
 
-                    if ip_valid_to_add_to_netbox(int_ip_address, self.permitted_subnets,
-                                                 self.excluded_subnets, int_full_name) is False:
-                        continue
-
-                    nic_ips[int_full_name].append(int_ip_address)
+                    if self.settings.permitted_subnets.permitted(int_ip_address, interface_name=int_full_name) is True:
+                        nic_ips[int_full_name].append(int_ip_address)
 
                 vm_nic_data = {
                     "name": int_full_name,
@@ -2586,7 +2385,8 @@ class VMWareHandler(SourceBase):
 
         # add VM to inventory
         self.add_device_vm_to_inventory(NBVM, object_data=vm_data, vnic_data=nic_data,
-                                        nic_ips=nic_ips, p_ipv4=vm_primary_ip4, p_ipv6=vm_primary_ip6)
+                                        nic_ips=nic_ips, p_ipv4=vm_primary_ip4, p_ipv6=vm_primary_ip6,
+                                        vmware_object=obj)
 
         return
 
@@ -2602,7 +2402,7 @@ class VMWareHandler(SourceBase):
         self.inventory.add_update_object(NBTag, data={
             "name": self.source_tag,
             "description": f"Marks objects synced from vCenter '{self.name}' "
-                           f"({self.host_fqdn}) to this NetBox Instance."
+                           f"({self.settings.host_fqdn}) to this NetBox Instance."
         })
 
         # update virtual site if present
@@ -2624,6 +2424,5 @@ class VMWareHandler(SourceBase):
                 "color": "9e9e9e",
                 "vm_role": True
             })
-
 
 # EOF

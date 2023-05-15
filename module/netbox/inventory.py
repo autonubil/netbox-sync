@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2022 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2023 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -7,7 +7,10 @@
 #  For a copy, see file LICENSE.txt included in this
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
-from module.netbox.object_classes import *
+import json
+
+from module.netbox import *
+from module.common.misc import grab
 from module.common.logging import get_logger
 from module.common.support import perform_ptr_lookups
 
@@ -16,34 +19,42 @@ log = get_logger()
 
 class NetBoxInventory:
     """
-    Class to manage a inventory of NetBoxObject objects
+    Singleton class to manage a inventory of NetBoxObject objects
     """
 
     base_structure = dict()
 
-    source_tags_of_disabled_sources = list()
+    source_list = list()
 
-    def __init__(self):
+    # track NetBox API version and provided it for all sources
+    netbox_api_version = "0.0.0"
 
-        # track NetBox API version and provided it for all sources
-        self.netbox_api_version = "0.0.0"
+    def __new__(cls):
+        it = cls.__dict__.get("__it__")
+        if it is not None:
+            return it
+        cls.__it__ = it = object.__new__(cls)
+        it.init()
+        return it
+
+    def init(self):
 
         for object_type in NetBoxObject.__subclasses__():
 
             self.base_structure[object_type.name] = list()
 
-    def add_disabled_source_tag(self, source_tag=None):
+    def add_source(self, source_handler=None):
         """
         adds $source_tag to list of disabled sources
 
         Parameters
         ----------
-        source_tag: str
-            source tag of disabled source
+        source_handler: object
+            source handler object
 
         """
-        if source_tag is not None:
-            self.source_tags_of_disabled_sources.append(source_tag)
+        if source_handler is not None:
+            self.source_list.append(source_handler)
 
     def get_by_id(self, object_type, nb_id=None):
         """
@@ -240,13 +251,13 @@ class NetBoxInventory:
 
         return self.base_structure.get(object_type.name, list())
 
-    def get_all_interfaces(self, this_object):
+    def get_all_interfaces(self, this_object: (NBVM, NBDevice)):
         """
         Return all interfaces items for a NBVM, NBDevice object
 
         Parameters
         ----------
-        this_object: (NBVM, NBDevice)
+        this_object: NBVM, NBDevice
             object instance to return interfaces for
 
         Returns
@@ -285,60 +296,66 @@ class NetBoxInventory:
             the object instance of a NetBox handler to get the tag names from
         """
 
+        all_sources_tags = [x.source_tag for x in self.source_list]
+        disabled_sources_tags = \
+            [x.source_tag for x in self.source_list if grab(x, "settings.enabled", fallback=False) is False]
+
         for object_type in NetBoxObject.__subclasses__():
 
             for this_object in self.get_all_items(object_type):
+
+                this_object_tags = this_object.get_tags()
 
                 # if object was found in source
                 if this_object.source is not None:
                     this_object.add_tags([netbox_handler.primary_tag, this_object.source.source_tag])
 
                     # if object was orphaned remove tag again
-                    if netbox_handler.orphaned_tag in this_object.get_tags():
+                    if netbox_handler.orphaned_tag in this_object_tags:
                         this_object.remove_tags(netbox_handler.orphaned_tag)
 
                 # if object was tagged by this program in previous runs but is not present
                 # anymore then add the orphaned tag except it originated from a disabled source
                 else:
-                    if bool(set(this_object.get_tags()).intersection(self.source_tags_of_disabled_sources)) is True:
-                        log.debug2(f"Object '{this_object.get_display_name()}' was added "
+
+                    if bool(set(this_object_tags).intersection(disabled_sources_tags)) is True:
+                        log.debug2(f"Object {this_object.__class__.name} '{this_object.get_display_name()}' was added "
                                    f"from a currently disabled source. Skipping orphaned tagging.")
                         continue
 
-                    if getattr(this_object, "prune", False) is True:
+                    # test for different conditions.
+                    if netbox_handler.primary_tag not in this_object_tags:
+                        continue
 
-                        # test for different conditions.
-                        if netbox_handler.primary_tag not in this_object.get_tags():
+                    if bool(set(this_object_tags).intersection(all_sources_tags)) is True:
+                        for source_tag in all_sources_tags:
+                            this_object.remove_tags(source_tag)
+                    elif netbox_handler.settings.ignore_unknown_source_object_pruning is True:
+                        continue
+
+                    if getattr(this_object, "prune", False) is False:
+                        # or just remove primary tag if pruning is disabled
+                        this_object.remove_tags(netbox_handler.orphaned_tag)
+                        continue
+
+                    # don't mark IPs as orphaned if vm/device is only switched off
+                    if isinstance(this_object, NBIPAddress):
+                        device_vm_object = this_object.get_device_vm()
+
+                        if device_vm_object is not None and \
+                                grab(device_vm_object, "data.status") is not None and \
+                                "active" not in str(grab(device_vm_object, "data.status")):
+
+                            if netbox_handler.orphaned_tag in this_object.get_tags():
+                                this_object.remove_tags(netbox_handler.orphaned_tag)
+
+                            log.debug2(f"{device_vm_object.name} '{device_vm_object.get_display_name()}' has IP "
+                                       f"'{this_object.get_display_name()}' assigned but is in status "
+                                       f"{grab(device_vm_object, 'data.status')}. "
+                                       f"IP address will not marked as orphaned.")
                             continue
 
-                        if netbox_handler.ignore_unknown_source_object_pruning is True:
-                            continue
-
-                        # don't mark IPs as orphaned if vm/device is only switched off
-                        if isinstance(this_object, NBIPAddress):
-                            device_vm_object = this_object.get_device_vm()
-
-                            if device_vm_object is not None and \
-                                    grab(device_vm_object, "data.status") is not None and \
-                                    "active" not in str(grab(device_vm_object, "data.status")):
-
-                                if netbox_handler.orphaned_tag in this_object.get_tags():
-                                    this_object.remove_tags(netbox_handler.orphaned_tag)
-
-                                log.debug2(f"{device_vm_object.name} '{device_vm_object.get_display_name()}' has IP "
-                                           f"'{this_object.get_display_name()}' assigned but is in status "
-                                           f"{grab(device_vm_object, 'data.status')}. "
-                                           f"IP address will not marked as orphaned.")
-                                continue
-
-                        this_object.add_tags(netbox_handler.orphaned_tag)
-
-                    # or just remove primary tag if pruning is disabled
-                    else:
-                        if netbox_handler.primary_tag in this_object.get_tags():
-                            this_object.remove_tags(netbox_handler.primary_tag)
-                        if netbox_handler.orphaned_tag in this_object.get_tags():
-                            this_object.remove_tags(netbox_handler.orphaned_tag)
+                    this_object.add_tags(netbox_handler.orphaned_tag)
 
     def query_ptr_records_for_all_ips(self):
         """
@@ -350,24 +367,24 @@ class NetBoxInventory:
         # store IP addresses to look them up in bulk
         ip_lookup_dict = dict()
 
-        # iterate over all IP addresses and try to match them to a prefix
+        # iterate over all IP addresses
         for ip in self.get_all_items(NBIPAddress):
 
             # ignore IPs which are not handled by any source
             if ip.source is None:
                 continue
 
-            # get IP and prefix length
+            # get IP without prefix length
             ip_a = grab(ip, "data.address", fallback="").split("/")[0]
 
             # check if we meant to look up DNS host name for this IP
-            if grab(ip, "source.dns_name_lookup", fallback=False) is True:
+            if grab(ip, "source.settings.dns_name_lookup", fallback=False) is True:
 
                 if ip_lookup_dict.get(ip.source) is None:
 
                     ip_lookup_dict[ip.source] = {
                         "ips": list(),
-                        "servers": grab(ip, "source.custom_dns_servers")
+                        "servers": grab(ip, "source.settings.custom_dns_servers")
                     }
 
                 ip_lookup_dict[ip.source].get("ips").append(ip_a)

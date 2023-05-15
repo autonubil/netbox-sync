@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2022 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2023 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -271,17 +271,6 @@ class NetBoxObject:
     # just skip this object if a mandatory attribute is missing
     skip_object_if_mandatory_attr_is_missing = False
 
-    # list of default attributes which are added to every NetBox object during init
-    default_attributes = {
-        "data": None,
-        "is_new": True,
-        "nb_id": 0,
-        "updated_items": list(),
-        "unset_items": list(),
-        "source": None,
-        "deleted": False
-    }
-
     # keep handle to inventory instance to append objects on demand
     inventory = None
 
@@ -292,18 +281,15 @@ class NetBoxObject:
                 f"are set in {self.__class__.__name__}."
             )
 
-        # inherit and create default attributes from parent
-        for attr_key, attr_value in self.default_attributes.items():
-            if isinstance(attr_value, (list, dict, set)):
-                setattr(self, attr_key, attr_value.copy())
-            else:
-                setattr(self, attr_key, attr_value)
-
-        # store provided inventory handle
-        self.inventory = inventory
-
-        # initialize empty data dict
+        # set default values
         self.data = dict()
+        self.inventory = inventory
+        self.is_new = True
+        self.nb_id = 0
+        self.updated_items = list()
+        self.unset_items = list()
+        self.source = source
+        self.deleted = False
 
         # add empty lists for list items
         for key, data_type in self.data_model.items():
@@ -1072,15 +1058,20 @@ class NetBoxObject:
         data_type = self.data_model.get(attribute_name)
         current_value = self.data.get(attribute_name)
 
-        if (data_type in [NBTagList, NBVLANList] or isinstance(data_type, (list, dict))) and len(current_value) == 0:
+        if (data_type in [NBTagList, NBVLANList] or isinstance(data_type, (list, dict))) and \
+                hasattr(current_value, '__len__') and len(current_value) == 0:
             return
 
         if current_value is None:
             return
 
+        if attribute_name in self.unset_items:
+            return
+
         # mark attribute to unset, this way it will be deleted in NetBox before any other updates are performed
         log.info(f"Setting attribute '{attribute_name}' for '{self.get_display_name()}' to None")
         self.unset_items.append(attribute_name)
+        self.data["assigned_object_id"] = None
 
     def get_nb_reference(self):
         """
@@ -1555,7 +1546,7 @@ class NBCluster(NetBoxObject):
     primary_key = "name"
     secondary_key = "site"
     prune = False
-    #include_secondary_key_if_present = True
+    # include_secondary_key_if_present = True
 
     def __init__(self, *args, **kwargs):
         self.data_model = {
@@ -1624,6 +1615,7 @@ class NBVM(NetBoxObject):
             "site": NBSite,
             "tags": NBTagList,
             "tenant": NBTenant,
+            "device": NBDevice,
             "custom_fields": NBCustomField
         }
         super().__init__(*args, **kwargs)
@@ -1651,6 +1643,15 @@ class NBVMInterface(NetBoxObject):
             "tags": NBTagList
         }
         super().__init__(*args, **kwargs)
+
+    def get_ip_addresses(self):
+
+        result_list = list()
+        for ip_object in self.inventory.get_all_items(NBIPAddress):
+            if grab(ip_object, "data.assigned_object_id") == self:
+                result_list.append(ip_object)
+
+        return result_list
 
 
 class NBInterface(NetBoxObject):
@@ -1685,6 +1686,15 @@ class NBInterface(NetBoxObject):
             "lag": NBInterface,
         }
         super().__init__(*args, **kwargs)
+
+    def get_ip_addresses(self):
+
+        result_list = list()
+        for ip_object in self.inventory.get_all_items(NBIPAddress):
+            if grab(ip_object, "data.assigned_object_id") == self:
+                result_list.append(ip_object)
+
+        return result_list
 
 
 class NBIPAddress(NetBoxObject):
@@ -1737,8 +1747,20 @@ class NBIPAddress(NetBoxObject):
         object_type = data.get("assigned_object_type")
         assigned_object = data.get("assigned_object_id")
 
+        # used to track changes in object primary IP assignments
+        previous_ip_device_vm = None
+        is_primary_ipv4_of_previous_device = False
+        is_primary_ipv6_of_previous_device = False
+
         # we got an object data structure where we have to find the object
         if read_from_netbox is False and assigned_object is not None:
+
+            # get current device to make sure to unset primary ip before moving IP address
+            previous_ip_device_vm = self.get_device_vm()
+            if grab(previous_ip_device_vm, "data.primary_ip4") is self:
+                is_primary_ipv4_of_previous_device = True
+            if grab(previous_ip_device_vm, "data.primary_ip6") is self:
+                is_primary_ipv6_of_previous_device = True
 
             if not isinstance(assigned_object, NetBoxObject):
 
@@ -1754,6 +1776,17 @@ class NBIPAddress(NetBoxObject):
         # we need to tell NetBox which object type this is meant to be
         if "assigned_object_id" in self.updated_items:
             self.updated_items.append("assigned_object_type")
+
+        if assigned_object is None or previous_ip_device_vm is None:
+            return
+
+        if previous_ip_device_vm is self.get_device_vm():
+            return
+
+        if is_primary_ipv4_of_previous_device is True:
+            previous_ip_device_vm.unset_attribute("primary_ip4")
+        if is_primary_ipv6_of_previous_device is True:
+            previous_ip_device_vm.unset_attribute("primary_ip6")
 
     def get_interface(self):
         o_id = self.data.get("assigned_object_id")
@@ -1800,6 +1833,20 @@ class NBIPAddressList(NBObjectList):
 
         return return_list
 
+    def remove_interface_association(self):
+        o_id = self.data.get("assigned_object_id")
+        o_type = self.data.get("assigned_object_type")
+        o_device = self.get_device_vm()
+
+        if grab(o_device, "data.primary_ip4") is self:
+            o_device.unset_attribute("primary_ip4")
+        if grab(o_device, "data.primary_ip6") is self:
+            o_device.unset_attribute("primary_ip6")
+
+        if o_id is not None:
+            self.unset_attribute("assigned_object_id")
+        if o_type is not None:
+            self.unset_attribute("assigned_object_type")
 
 class NBFHRPGroupItem(NetBoxObject):
     """
@@ -1807,10 +1854,8 @@ class NBFHRPGroupItem(NetBoxObject):
     """
     name = "FHRP group"
     api_path = "/ipam/fhrp-groups"
-    primary_key = "description"
-    secondary_key = "group_id"
-    enforce_secondary_key = True
-    prune = True
+    primary_key = "group_id"
+    prune = False
 
     def __init__(self, *args, **kwargs):
         self.data_model = {
@@ -1889,5 +1934,20 @@ class NBPowerPort(NetBoxObject):
             "custom_fields": NBCustomField
         }
         super().__init__(*args, **kwargs)
+
+    def update(self, data=None, read_from_netbox=False, source=None):
+
+        # take care of "maximum_draw" API limitation
+        maximum_draw = data.get("maximum_draw")
+        if maximum_draw is not None:
+            try:
+                maximum_draw = int(maximum_draw)
+            except ValueError:
+                data.pop("maximum_draw")
+
+            if maximum_draw < 1:
+                data.pop("maximum_draw")
+
+        super().update(data=data, read_from_netbox=read_from_netbox, source=source)
 
 # EOF

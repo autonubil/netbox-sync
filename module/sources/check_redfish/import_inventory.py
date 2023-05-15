@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2022 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2023 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -7,7 +7,6 @@
 #  For a copy, see file LICENSE.txt included in this
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
-from ipaddress import ip_network
 import os
 import glob
 import json
@@ -15,35 +14,12 @@ import json
 from packaging import version
 
 from module.sources.common.source_base import SourceBase
+from module.sources.check_redfish.config import CheckRedfishConfig
 from module.common.logging import get_logger
 from module.common.misc import grab, get_string_or_none
-from module.common.support import normalize_mac_address, ip_valid_to_add_to_netbox
-from module.netbox.object_classes import (
-    NetBoxInterfaceType,
-    NBTag,
-    NBManufacturer,
-    NBDeviceType,
-    NBPlatform,
-    NBClusterType,
-    NBClusterGroup,
-    NBDeviceRole,
-    NBSite,
-    NBSiteGroup,
-    NBCluster,
-    NBDevice,
-    NBInterface,
-    NBIPAddress,
-    NBPrefix,
-    NBTenant,
-    NBTenantGroup,
-    NBFHRPGroupItem,
-    NBFHRPGroupAssignment,
-    NBVRF,
-    NBVLAN,
-    NBPowerPort,
-    NBInventoryItem,
-    NBCustomField
-)
+from module.common.support import normalize_mac_address
+from module.netbox.inventory import NetBoxInventory
+from module.netbox import *
 
 log = get_logger()
 
@@ -82,102 +58,33 @@ class CheckRedfish(SourceBase):
         NBCustomField
     ]
 
-    settings = {
-        "enabled": True,
-        "inventory_file_path": None,
-        "permitted_subnets": None,
-        "overwrite_host_name": False,
-        "overwrite_power_supply_name": False,
-        "overwrite_power_supply_attributes": True,
-        "overwrite_interface_name": False,
-        "overwrite_interface_attributes": True,
-    }
-
-    init_successful = False
-    inventory = None
-    name = None
-    source_tag = None
     source_type = "check_redfish"
-    enabled = False
-    inventory_file_path = None
+
     device_object = None
     inventory_file_content = None
 
-    def __init__(self, name=None, settings=None, inventory=None):
+    def __init__(self, name=None):
 
         if name is None:
             raise ValueError(f"Invalid value for attribute 'name': '{name}'.")
 
-        self.inventory = inventory
+        self.inventory = NetBoxInventory()
         self.name = name
 
-        self.parse_config_settings(settings)
+        # parse settings
+        settings_handler = CheckRedfishConfig()
+        settings_handler.source_name = self.name
+        self.settings = settings_handler.parse()
 
-        self.source_tag = f"Source: {name}"
+        self.set_source_tag()
 
-        if self.enabled is False:
+        if self.settings.enabled is False:
             log.info(f"Source '{name}' is currently disabled. Skipping")
             return
 
         self.init_successful = True
 
         self.interface_adapter_type_dict = dict()
-
-    def parse_config_settings(self, config_settings):
-        """
-        Validate parsed settings from config file
-
-        Parameters
-        ----------
-        config_settings: dict
-            dict of config settings
-
-        """
-
-        validation_failed = False
-
-        for setting in ["inventory_file_path"]:
-            if config_settings.get(setting) is None:
-                log.error(f"Config option '{setting}' in 'source/{self.name}' can't be empty/undefined")
-                validation_failed = True
-
-        inv_path = config_settings.get("inventory_file_path")
-        if not os.path.exists(inv_path):
-            log.error(f"Inventory file path '{inv_path}' not found.")
-            validation_failed = True
-
-        if os.path.isfile(inv_path):
-            log.error(f"Inventory file path '{inv_path}' needs to be a directory.")
-            validation_failed = True
-
-        if not os.access(inv_path, os.X_OK | os.R_OK):
-            log.error(f"Inventory file path '{inv_path}' not readable.")
-            validation_failed = True
-
-        # check permitted ip subnets
-        if config_settings.get("permitted_subnets") is None:
-            log.info(f"Config option 'permitted_subnets' in 'source/{self.name}' is undefined. "
-                     f"No IP addresses will be populated to NetBox!")
-        else:
-            config_settings["permitted_subnets"] = \
-                [x.strip() for x in config_settings.get("permitted_subnets").split(",") if x.strip() != ""]
-
-            permitted_subnets = list()
-            for permitted_subnet in config_settings["permitted_subnets"]:
-                try:
-                    permitted_subnets.append(ip_network(permitted_subnet))
-                except Exception as e:
-                    log.error(f"Problem parsing permitted subnet: {e}")
-                    validation_failed = True
-
-            config_settings["permitted_subnets"] = permitted_subnets
-
-        if validation_failed is True:
-            log.error("Config validation failed. Exit!")
-            exit(1)
-
-        for setting in self.settings.keys():
-            setattr(self, setting, config_settings.get(setting))
 
     def apply(self):
         """
@@ -193,7 +100,7 @@ class CheckRedfish(SourceBase):
         # first add all custom fields we need for this source
         self.add_necessary_base_objects()
 
-        for filename in glob.glob(f"{self.inventory_file_path}/*.json"):
+        for filename in glob.glob(f"{self.settings.inventory_file_path}/*.json"):
 
             self.reset_inventory_state()
 
@@ -202,6 +109,14 @@ class CheckRedfish(SourceBase):
 
             # try to get device by supplied NetBox id
             inventory_id = grab(self.inventory_file_content, "meta.inventory_id")
+
+            # parse inventory id to int as all NetBox ids are type integer
+            try:
+                inventory_id = int(inventory_id)
+            except (ValueError, TypeError):
+                log.error(f"Value for meta.inventory_id '{inventory_id}' must be an integer. "
+                          f"Cannot use inventory_id to match device in NetBox.")
+
             self.device_object = self.inventory.get_by_id(NBDevice, inventory_id)
 
             # try to find device by serial of first system in inventory
@@ -296,12 +211,13 @@ class CheckRedfish(SourceBase):
 
         serial = get_string_or_none(grab(system, "serial"))
         name = get_string_or_none(grab(system, "host_name"))
+        manufacturer = get_string_or_none(grab(system, "manufacturer"))
 
         device_data = {
             "device_type": {
                 "model": get_string_or_none(grab(system, "model")),
                 "manufacturer": {
-                    "name": get_string_or_none(grab(system, "manufacturer"))
+                    "name": manufacturer
                 },
             },
             "status": status,
@@ -312,8 +228,27 @@ class CheckRedfish(SourceBase):
 
         if serial is not None:
             device_data["serial"] = serial
-        if name is not None and self.overwrite_host_name is True:
+        if name is not None and self.settings.overwrite_host_name is True:
             device_data["name"] = name
+        if "dell" in str(manufacturer).lower():
+            chassi = grab(self.inventory_file_content, "inventory.chassi.0")
+            if chassi and "sku" in chassi:
+
+                # add ServiceTag
+                self.add_update_custom_field({
+                    "name": "service_tag",
+                    "label": "Service Tag",
+                    "content_types": [
+                        "dcim.device"
+                    ],
+                    "type": "text",
+                    "description": "Dell Service Tag"
+                })
+
+                device_data["custom_fields"]["service_tag"] = chassi.get("sku")
+            else:
+                log.warning(f"No chassi or sku data found for "
+                            f"'{self.device_object.get_display_name()}' in inventory file.")
 
         self.device_object.update(data=device_data, source=self)
 
@@ -327,7 +262,7 @@ class CheckRedfish(SourceBase):
 
         current_ps.sort(key=lambda x: grab(x, "data.name"))
 
-        ps_index = 0
+        ps_index = 1
         ps_items = list()
         for ps in grab(self.inventory_file_content, "inventory.power_supply", fallback=list()):
 
@@ -335,7 +270,6 @@ class CheckRedfish(SourceBase):
                 continue
 
             ps_name = get_string_or_none(grab(ps, "name"))
-            input_voltage = get_string_or_none(grab(ps, "input_voltage"))
             ps_type = get_string_or_none(grab(ps, "type"))
             bay = get_string_or_none(grab(ps, "bay"))
             capacity_in_watt = grab(ps, "capacity_in_watt")
@@ -351,8 +285,6 @@ class CheckRedfish(SourceBase):
                 ps_name += f" {bay}"
 
             name_details = list()
-            if input_voltage is not None:
-                name_details.append(f"{input_voltage}V")
             if ps_type is not None:
                 name_details.append(f"{ps_type}")
 
@@ -395,15 +327,26 @@ class CheckRedfish(SourceBase):
                 ps_data["custom_fields"] = {"firmware": firmware, "health": health_status}
 
             # add/update power supply data
-            ps_object = grab(current_ps, f"{ps_index}")
+            ps_object = None
+            for current_ps_item in current_ps:
+                current_ps_item_name = grab(current_ps_item, "data.name", fallback="")
+                if ps_name.lower() in current_ps_item_name.lower():
+                    ps_object = current_ps_item
+                    break
+
+                if str(ps_index) in current_ps_item_name.split(" "):
+                    ps_object = current_ps_item
+                    break
+
             if ps_object is None:
                 self.inventory.add_object(NBPowerPort, data=ps_data, source=self)
             else:
-                if self.overwrite_power_supply_name is False:
+                if self.settings.overwrite_power_supply_name is False:
                     del(ps_data["name"])
 
-                data_to_update = self.patch_data(ps_object, ps_data, self.overwrite_power_supply_attributes)
+                data_to_update = self.patch_data(ps_object, ps_data, self.settings.overwrite_power_supply_attributes)
                 ps_object.update(data=data_to_update, source=self)
+                current_ps.remove(ps_object)
 
             ps_index += 1
 
@@ -835,13 +778,13 @@ class CheckRedfish(SourceBase):
             # collect ip addresses
             nic_ips[port_name] = list()
             for ipv4_address in grab(nic_port, "ipv4_addresses", fallback=list()):
-                if ip_valid_to_add_to_netbox(ipv4_address, self.permitted_subnets, interface_name=port_name) is False:
+                if self.settings.permitted_subnets.permitted(ipv4_address, interface_name=port_name) is False:
                     continue
 
                 nic_ips[port_name].append(ipv4_address)
 
             for ipv6_address in grab(nic_port, "ipv6_addresses", fallback=list()):
-                if ip_valid_to_add_to_netbox(ipv6_address, self.permitted_subnets, interface_name=port_name) is False:
+                if self.settings.permitted_subnets.permitted(ipv6_address, interface_name=port_name) is False:
                     continue
 
                 nic_ips[port_name].append(ipv6_address)
@@ -868,12 +811,12 @@ class CheckRedfish(SourceBase):
 
             # create or update interface with data
             if nic_object is not None:
-                if self.overwrite_interface_name is False and port_data.get("name") is not None:
+                if self.settings.overwrite_interface_name is False and port_data.get("name") is not None:
                     del(port_data["name"])
 
                 this_link_type = port_data.get("type")
                 mgmt_only = port_data.get("mgmt_only")
-                data_to_update = self.patch_data(nic_object, port_data, self.overwrite_interface_attributes)
+                data_to_update = self.patch_data(nic_object, port_data, self.settings.overwrite_interface_attributes)
 
                 # always overwrite nic type if discovered
                 if port_data.get("type") != "other":

@@ -17,11 +17,13 @@ from packaging import version
 from pytablewriter import IpAddress
 
 from .api_client import SophosUTMClient
+from .config import CheckSophosConfig
 
 from module.sources.common.source_base import SourceBase
 from module.common.logging import get_logger, DEBUG3
 from module.common.misc import grab, dump, get_string_or_none, plural, quoted_split
-from module.common.support import normalize_mac_address, ip_valid_to_add_to_netbox
+from module.common.support import normalize_mac_address
+from module.netbox.inventory import NetBoxInventory
 from module.netbox.object_classes import (
     NBFHRPGroupItem,
     NBFHRPGroupAssignment,
@@ -91,28 +93,6 @@ class SophosUTMHandler(SourceBase):
         NBCustomField
     ]
 
-    settings = {
-        "enabled": True,
-        "host_fqdn": None,
-        "port": 443,
-        "username": None,
-        "password": None,
-        "validate_tls_certs": False,
-        "proxy_host": None,
-        "proxy_port": None,
-        "vrf": None,
-        "site_group": None,
-        "group_vlans": None,
-        "site_a": None,
-        "site_b": None,
-        "site_floating": None,
-        "site_spare": None,
-        "tenant_group": None,
-        "create_company_tenant_group": False,
-        "cluster_sync": False,
-        "fhrp_id": 1,
-    }
-
     deprecated_settings = {}
 
     removed_settings = {}
@@ -151,15 +131,19 @@ class SophosUTMHandler(SourceBase):
     is_active_active = False
     internal_device_name = "Sophos"
 
-    def __init__(self, name=None, settings=None, inventory=None):
+    def __init__(self, name=None):
 
         if name is None:
             raise ValueError(f"Invalid value for attribute 'name': '{name}'.")
 
-        self.inventory = inventory
+        self.inventory = NetBoxInventory()
         self.name = name
 
-        self.parse_config_settings(settings)
+        settings_handler = CheckSophosConfig()
+        settings_handler.source_name = self.name
+        self.settings = settings_handler.parse()
+
+        self.parse_config_settings(self.settings)
 
         self.source_tag = f"Source: {name}"
         self.site_name = f"sophos: {name}"
@@ -168,7 +152,7 @@ class SophosUTMHandler(SourceBase):
             log.info(f"Source '{name}' is currently disabled. Skipping")
             return
 
-        self.client = SophosUTMClient(settings)
+        self.client = SophosUTMClient(self.settings)
         self.init_successful = True
 
     def apply(self):
@@ -698,18 +682,19 @@ class SophosUTMHandler(SourceBase):
 
         """
 
-        validation_failed = False
-
-        for setting in ["host_fqdn", "port", "username", "password"]:
-            if config_settings.get(setting) is None:
-                log.error(
-                    f"Config option '{setting}' in 'source/{self.name}' can't be empty/undefined")
-                validation_failed = True
-
-        if validation_failed is True:
-            log.error("Config validation failed. Exit!")
-            exit(1)
-
-        for setting in self.settings.keys():
-            setattr(self, setting, config_settings.get(setting))
+        for setting in [
+            "vrf",
+            "site_group",
+            "group_vlans",
+            "site_a",
+            "site_b",
+            "site_floating",
+            "site_spare",
+            "tenant_group",
+            "create_company_tenant_group",
+            "cluster_sync",
+            "fhrp_id"]:
+                if hasattr(self.settings, setting):
+                    setattr(self, setting, getattr(self.settings, setting))
+        
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2022 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2023 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -11,20 +11,7 @@ import re
 
 from ipaddress import ip_interface, ip_address, IPv6Address, IPv4Address, IPv6Network, IPv4Network
 
-from module.netbox.inventory import (
-    NetBoxObject,
-    NBDevice,
-    NBVM,
-    NBInterface,
-    NBVMInterface,
-    NBSite,
-    NBSiteGroup,
-    NBPrefix,
-    NBIPAddress,
-    NBVLANGroup,
-    NBVLAN,
-    NBCustomField
-)
+from module.netbox import *
 from module.common.logging import get_logger
 from module.common.misc import grab
 from module.netbox.object_classes import NBSiteGroup
@@ -39,6 +26,24 @@ class SourceBase:
 
     inventory = None
     source_tag = None
+    settings = None
+    init_successful = False
+    name = None
+
+    def set_source_tag(self):
+        self.source_tag = f"Source: {self.name}"
+
+    @classmethod
+    def implements(cls, source_type):
+
+        if getattr(cls, "source_type", None) == source_type:
+            return True
+
+        return False
+
+    # stub function to implement a finish call for each source
+    def finish(self):
+        pass
 
     def map_object_interfaces_to_current_interfaces(self, device_vm_object, interface_data_dict=None):
         """
@@ -218,7 +223,7 @@ class SourceBase:
         return current_longest_matching_prefix
 
     def add_update_interface(self, interface_object, device_object, interface_data, interface_ips=None,
-                             disable_vlan_sync=False, ip_tenant_inheritance_order=None):
+                             vmware_object=None):
         """
         Adds/Updates an interface to/of a NBVM or NBDevice including IP addresses.
         Validates/enriches data in following order:
@@ -241,10 +246,8 @@ class SourceBase:
             dictionary with interface attributes to add to this interface
         interface_ips: list
             list of ip addresses which are assigned to this interface
-        disable_vlan_sync: bool
-            if True, VLAN information will be removed from interface before creating/updating interface
-        ip_tenant_inheritance_order: list
-            list of order in which the IP tenant should be assigned, possible values: device, prefix, disabled
+        vmware_object: (vim.HostSystem, vim.VirtualMachine)
+            object to add to list of objects to reevaluate
 
         Returns
         -------
@@ -252,6 +255,14 @@ class SourceBase:
             tuple with interface object that was added/updated and a list of ip address objects which were
             added to this interface
         """
+
+        disable_vlan_sync = False
+        if "disable_vlan_sync" in self.settings:
+            disable_vlan_sync = self.settings.disable_vlan_sync
+
+        ip_tenant_inheritance_order = None
+        if "ip_tenant_inheritance_order" in self.settings:
+            ip_tenant_inheritance_order = self.settings.ip_tenant_inheritance_order
 
         if not isinstance(interface_data, dict):
             log.error(f"Attribute 'interface_data' must be a dict() got {type(interface_data)}.")
@@ -279,11 +290,11 @@ class SourceBase:
         # vlans get added later once we have the prefixes for the IP addresses
         untagged_vlan = interface_data.get("untagged_vlan")
         if untagged_vlan is not None:
-            del(interface_data["untagged_vlan"])
+            del interface_data["untagged_vlan"]
 
         tagged_vlans = interface_data.get("tagged_vlans") or list()
         if len(tagged_vlans) > 0:
-            del (interface_data["tagged_vlans"])
+            del interface_data["tagged_vlans"]
 
         # delete information about any vlans if sync is disable.
         if disable_vlan_sync is True:
@@ -389,10 +400,11 @@ class SourceBase:
                 if not ip_address_string.startswith(f"{ip_object.ip.compressed}/"):
                     continue
 
-                current_nic = grab(ip, "data.assigned_object_id")
+                current_ip_nic = ip.get_interface()
+                current_ip_device = ip.get_device_vm()
 
                 # is it our current ip interface?
-                if current_nic == interface_object:
+                if current_ip_nic == interface_object:
                     this_ip_object = ip
                     break
 
@@ -404,34 +416,56 @@ class SourceBase:
                     continue
 
                 # IP address is not assigned to any interface
-                if not isinstance(current_nic, (NBInterface, NBVMInterface)):
+                if not isinstance(current_ip_nic, (NBInterface, NBVMInterface)):
+                    this_ip_object = ip
+                    break
+
+                # IP address already belongs to the device but maybe to a different interface
+                if device_object is current_ip_device:
                     this_ip_object = ip
                     break
 
                 # get current IP interface status
-                current_nic_enabled = grab(current_nic, "data.enabled", fallback=True)
+                current_nic_enabled = grab(current_ip_nic, "data.enabled", fallback=True)
                 this_nic_enabled = grab(interface_object, "data.enabled", fallback=True)
 
+                # if device or VM is NOT active, set current nic status to disabled
+                if "active" not in str(grab(current_ip_device, "data.status")):
+                    current_nic_enabled = False
+
                 if current_nic_enabled is True and this_nic_enabled is False:
-                    log.debug(f"Current interface '{current_nic.get_display_name()}' for IP '{ip_object}'"
+                    log.debug(f"Current interface '{current_ip_nic.get_display_name()}' for IP '{ip_object}'"
                               f" is enabled and this one '{interface_object.get_display_name()}' is disabled. "
                               f"IP assignment skipped!")
                     skip_this_ip = True
                     break
 
                 if current_nic_enabled is False and this_nic_enabled is True:
-                    log.debug(f"Current interface '{current_nic.get_display_name()}' for IP '{ip_object}'"
+                    log.debug(f"Current interface '{current_ip_nic.get_display_name()}' for IP '{ip_object}'"
                               f" is disabled and this one '{interface_object.get_display_name()}' is enabled. "
                               f"IP will be assigned to this interface.")
 
                     this_ip_object = ip
 
                 if current_nic_enabled == this_nic_enabled:
+
+                    this_log_handler = log.warning
                     state = "enabled" if this_nic_enabled is True else "disabled"
-                    log.warning(f"Current interface '{current_nic.get_display_name()}' for IP "
-                                f"'{ip_object}' and this one '{interface_object.get_display_name()}' are "
-                                f"both {state}. "
-                                f"IP assignment skipped because it is unclear which one is the correct one!")
+                    log_msg = (f"Current interface '{current_ip_nic.get_display_name()}' for IP "
+                               f"'{ip_object}' and this one '{interface_object.get_display_name()}' are "
+                               f"both {state}.")
+
+                    if hasattr(self, "objects_to_reevaluate") and vmware_object is not None and \
+                            getattr(self, "parsing_objects_to_reevaluate", True) is False:
+                        if vmware_object not in self.objects_to_reevaluate:
+                            self.objects_to_reevaluate.append(vmware_object)
+                        this_log_handler = log.debug
+                        log_msg += f" The {device_object.name} will be checked later again to see if " \
+                                   f"current interface status or association has changed"
+                    else:
+                        log_msg += " IP assignment skipped because it is unclear which one is the correct one!"
+
+                    this_log_handler(log_msg)
                     skip_this_ip = True
                     break
 
@@ -481,6 +515,12 @@ class SourceBase:
                 this_ip_object.update(data=nic_ip_data, source=self)
 
             ip_address_objects.append(this_ip_object)
+
+        for current_ip in interface_object.get_ip_addresses():
+            if current_ip not in ip_address_objects:
+                log.info(f"{current_ip.name} is no longer assigned to {interface_object.get_display_name()} and "
+                         f"therefore removed from this interface")
+                current_ip.remove_interface_association()
 
         matching_untagged_vlan = None
         matching_tagged_vlans = dict()
@@ -652,7 +692,7 @@ class SourceBase:
 
         return return_data
 
-    def add_update_custom_field(self, data):
+    def add_update_custom_field(self, data) -> NBCustomField:
         """
         Adds/updates a NBCustomField object with data.
         Update will only update the 'content_types' attribute.
