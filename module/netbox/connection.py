@@ -23,6 +23,7 @@ from module.common.misc import grab, do_error_exit, plural
 from module.netbox import *
 from module.netbox.inventory import NetBoxInventory
 from module.netbox.config import NetBoxConfig
+from ipaddress import IPv6Network, IPv4Network
 from module import __version__
 
 log = get_logger()
