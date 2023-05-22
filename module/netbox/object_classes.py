@@ -1815,6 +1815,21 @@ class NBIPAddress(NetBoxObject):
         elif isinstance(o_interface, NBVMInterface):
             return o_interface.data.get("virtual_machine")
 
+    def remove_interface_association(self):
+        o_id = self.data.get("assigned_object_id")
+        o_type = self.data.get("assigned_object_type")
+        o_device = self.get_device_vm()
+
+        if grab(o_device, "data.primary_ip4") is self:
+            o_device.unset_attribute("primary_ip4")
+        if grab(o_device, "data.primary_ip6") is self:
+            o_device.unset_attribute("primary_ip6")
+
+        if o_id is not None:
+            self.unset_attribute("assigned_object_id")
+        if o_type is not None:
+            self.unset_attribute("assigned_object_type")
+
 class NBIPAddressList(NBObjectList):
     member_type = NBIPAddress
 
